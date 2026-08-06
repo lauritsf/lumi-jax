@@ -54,6 +54,29 @@ genuinely embed libtorch. (Mixture of Experts is *not* in that kernel; it is a P
 Both the jax line and the variant are recorded in the venv, so an existing install keeps the
 image it was built against when a default moves, and every `sbatch` here resolves the same one.
 
+### Layering your own venv over `torch`
+
+Put your `site-packages` ahead of the image's, or your pins lose to it:
+
+```bash
+export PYTHONPATH=$VIRTUAL_ENV/lib/python3.12/site-packages:/opt/venv/lib/python3.12/site-packages
+```
+
+`torch` keeps jax in `/opt/jax-venv` and reaches PyTorch in `/opt/venv` through `PYTHONPATH`,
+which outranks the interpreter's own `site-packages` and therefore any venv layered on top —
+so a numpy pinned in your venv still imports the container's. Measured with a venv pinning
+numpy 2.3.5 against the image's 2.1.3:
+
+| `PYTHONPATH` | numpy resolves to | torch |
+|---|---|---|
+| inherited from the image | **2.1.3** — your pin is shadowed | 2.10.0 |
+| cleared | 2.3.5 | **missing** |
+| your venv first, `/opt/venv` after | 2.3.5 | 2.10.0 |
+
+Clearing it is not a fix: torch is reachable *only* through that variable once your own venv
+is active. `lean` has none of this — jax is in the interpreter's own venv and `PYTHONPATH`
+carries only the kernels package — so prefer it unless you need PyTorch in-process.
+
 ### Which JAX
 
 Both installers default to 0.11.0:
