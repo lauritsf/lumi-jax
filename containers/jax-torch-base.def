@@ -80,6 +80,15 @@ From: {{ BASE }}
     ldconfig
     test -e "$PLUGIN_DIR/libnccl-net.so" || { echo "FATAL: no libnccl-net.so"; exit 1; }
 
+    # KNOWN DEFECT, to fix on a rebuild of this chain: the LAIF full root exports
+    # PYTHONPATH=/opt/venv/lib/python3.12/site-packages and we layer a second venv over it,
+    # so torch is reached through PYTHONPATH while jax lives here. PYTHONPATH precedes the
+    # interpreter's own site-packages, so a venv layered over this image has its pins
+    # shadowed by anything /opt/venv also ships -- numpy and scipy in practice. Clearing
+    # PYTHONPATH is not the fix: the .pth below is not read by a downstream venv, so torch
+    # disappears instead. The fix is jax in /opt/venv rather than a second venv, and it
+    # invalidates every rung above this one on both jax lines.
+
     # --system-site-packages plus the .pth puts torch, vllm etc. in JAX's interpreter.
     python3 -m venv /opt/jax-venv --system-site-packages
     echo /opt/venv/lib/python3.12/site-packages \
