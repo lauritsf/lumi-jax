@@ -117,7 +117,9 @@ PYEOF
 %environment
     export CAUSAL_CONV1D_ROOT=/opt/causal-conv1d
     export FA_SRC_ROOT=/opt/fa-src
-    # So `import lumi_kernels` works with no install; an editable checkout still wins.
+    # So `import lumi_kernels` works with no install. PYTHONPATH precedes site-packages,
+    # so this SHADOWS an editable checkout in a layered venv; unset it to develop against
+    # one (activate.sh does).
     export PYTHONPATH=/opt/lumi-jax:${PYTHONPATH:-}
 
 %test
@@ -154,7 +156,8 @@ assert len(k) == 4, k
     Use it:   singularity exec <image> python3 -c "import lumi_kernels; ..."
     PYTHONPATH already points at /opt/lumi-jax, so no install step is needed.
 
-    To rebuild a kernel while developing, bind your checkout and install it editable in your
-    own venv: its lumi_kernels/lib wins over this one. The sources are in the image --
+    To rebuild a kernel while developing, bind your checkout, install it editable in your own
+    venv and drop /opt/lumi-jax from PYTHONPATH -- otherwise the baked package shadows the
+    checkout and its lumi_kernels/lib never wins. The sources are in the image --
     FA_SRC_ROOT=/opt/fa-src, CAUSAL_CONV1D_ROOT=/opt/causal-conv1d, and CK_FMHA_ROOT /
     AOTRITON_ROOT from the base.

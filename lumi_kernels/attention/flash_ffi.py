@@ -32,9 +32,15 @@ def _ensure_registered():
     global _registered, _DUMMY_ALIBI
     if _registered:
         return
-    import torch  # noqa: F401  (pulls libtorch/libc10 in before we dlopen ours)
-    import flash_attn  # noqa: F401
-    lib = ctypes.CDLL(_so_path(_SO_NAME))
+    # torch is a fallback, not a requirement: a torch-built .so links libtorch/libc10,
+    # which resolve only after torch and flash_attn load; a torch-free build is
+    # self-contained and dlopens bare.
+    try:
+        lib = ctypes.CDLL(_so_path(_SO_NAME))
+    except OSError:
+        import torch  # noqa: F401  (pulls libtorch/libc10 in before we dlopen ours)
+        import flash_attn  # noqa: F401
+        lib = ctypes.CDLL(_so_path(_SO_NAME))
     for target, symbol in (("lumi_fa_fwd", "LumiFaFwd"), ("lumi_fa_bwd", "LumiFaBwd"),
                            ("lumi_fa_varlen_fwd", "LumiFaVarlenFwd"),
                            ("lumi_fa_varlen_bwd", "LumiFaVarlenBwd"),
