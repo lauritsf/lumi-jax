@@ -1,0 +1,160 @@
+# The four torch-free kernels (aotriton, flash, sscan, conv1d), baked into the lean image.
+# The fifth, csrc/vllm, embeds libtorch and needs the full image.
+#   sbatch containers/build_causal_conv1d.sbatch       # once, if /scratch lost it
+#   sbatch containers/build_jax_kernels_lean.sbatch
+#
+# The point of the layer: library and RPATH both inside the SIF (asserted in %post). Built
+# IN %post, unlike CK FMHA and libcausal_conv1d.so, because these four shims are six TUs
+# between them and those two are ~2700 hipcc invocations under PRoot's ~4x overhead.
+
+# BASE (--build-arg) is the lean head, which already carries AOTriton and CK FMHA. THIS
+# LAYER IS JAX-LINE SPECIFIC: every FFI shim compiles against jaxlib's XLA FFI headers, so
+# its output must not be retargeted afterwards.
+Bootstrap: localimage
+From: {{ BASE }}
+
+%files
+    csrc /opt/lumi-jax/csrc
+    lumi_kernels /opt/lumi-jax/lumi_kernels
+    pyproject.toml /opt/lumi-jax/pyproject.toml
+
+    {{ CONV1D_SRC }}/lib /opt/causal-conv1d/lib
+    {{ CONV1D_SRC }}/include /opt/causal-conv1d/include
+
+    # Only the subtree sscan compiles; CK FMHA arrives as a library from the base.
+    {{ FA_SRC }}/mamba/csrc/selective_scan /opt/fa-src/mamba/csrc/selective_scan
+
+%post
+    set -eux
+
+    # %files preserves source modes, and vendored sources have shipped 0770 root:root.
+    chmod -R a+rX /opt/lumi-jax /opt/causal-conv1d /opt/fa-src
+
+    # DELETE WHATEVER THE CHECKOUT BROUGHT: %files copies lumi_kernels/ wholesale, so after
+    # a local csrc/*/build_*.sh it carries .so files -- including the libtorch-linked
+    # liblumi_vllm_ffi.so.
+    rm -f /opt/lumi-jax/lumi_kernels/lib/*.so
+    rm -rf /opt/lumi-jax/lumi_kernels/__pycache__ /opt/lumi-jax/csrc/*/__pycache__
+
+    . /opt/venv/bin/activate
+    export FA_SRC_ROOT=/opt/fa-src
+
+    # Ray Tune AT THE LEAF: at rung 1 it invalidates rungs 2-5, a 13-job rebuild. Under
+    # constraints, because ray's deps are how an unconstrained pip moves jax.
+    pip install --no-cache-dir -c /opt/venv/lumi-jax-constraints.txt 'ray[tune]'
+    python3 - <<'PYEOF'
+import importlib.metadata as md
+import ray, ray.tune, jax
+print("ray", ray.__version__, "| jax", jax.__version__)
+assert jax.__version__ == md.version("jax"), (jax.__version__, md.version("jax"))
+try:
+    import torch
+except ImportError:
+    print("no torch, as intended for the lean line")
+else:
+    raise SystemExit("FATAL: ray pulled torch into the lean image")
+PYEOF
+
+    cd /opt/lumi-jax
+    pip install --no-cache-dir -e .
+
+    # LUMI_C10_SHIM=1 is belt and braces; the scripts already fall back to csrc/shim-c10.
+    export LUMI_C10_SHIM=1
+    python3 -c "import torch" 2>/dev/null \
+        && { echo "FATAL: torch is present on the lean image -- wrong BASE?"; exit 1; } \
+        || echo "no torch, as expected"
+
+    # Exit codes per pid: a bare `wait` reports only the last job's status.
+    mkdir -p /tmp/kbuild
+    pids=""
+    for s in sscan/build_sscan.sh conv1d/build_conv1d.sh flash/build_ffi.sh \
+             aotriton/build_aotriton.sh; do
+        name="$(basename "$(dirname "$s")")"
+        ( bash "csrc/$s" > "/tmp/kbuild/$name.log" 2>&1 ) &
+        pids="$pids $!:$name"
+        echo "started $name (pid $!)"
+    done
+
+    rc=0
+    for p in $pids; do
+        pid="${p%%:*}"; name="${p##*:}"
+        if wait "$pid"; then echo "=== $name OK ==="; else echo "=== $name FAILED ==="; rc=1; fi
+        tail -25 "/tmp/kbuild/$name.log"
+    done
+    [ "$rc" -eq 0 ] || { echo "FATAL: one or more kernel builds failed"; exit 1; }
+    rm -rf /tmp/kbuild
+
+    LIB=/opt/lumi-jax/lumi_kernels/lib
+    for so in liblumi_sscan.so liblumi_conv1d.so liblumi_fa_ffi.so liblumi_aotriton.so; do
+        test -s "$LIB/$so" || { echo "FATAL: $so was not built"; exit 1; }
+    done
+
+    # THE CLAIM OF THIS IMAGE, three ways. 1. no torch in any link map.
+    for so in "$LIB"/liblumi_*.so; do
+        if readelf -d "$so" | grep -qE 'NEEDED.*(torch|c10)'; then
+            echo "FATAL: $(basename "$so") links torch"; exit 1
+        fi
+    done
+    # 2. no RPATH outside the image; such a path resolves where it was built and nowhere else.
+    for so in "$LIB"/liblumi_*.so; do
+        if readelf -d "$so" | grep -E 'R(UN)?PATH' | grep -qE '/scratch|/pfs|/projappl'; then
+            echo "FATAL: $(basename "$so") has an RPATH outside the image:"
+            readelf -d "$so" | grep -E 'R(UN)?PATH'
+            exit 1
+        fi
+    done
+    # 3. every library the loader needs resolves, which neither check above implies.
+    for so in "$LIB"/liblumi_*.so; do
+        if ldd "$so" | grep -q 'not found'; then
+            echo "FATAL: unresolved dependencies for $(basename "$so"):"
+            ldd "$so" | grep 'not found'
+            exit 1
+        fi
+        echo "ok  $(basename "$so")"
+    done
+    ls -la "$LIB"
+
+%environment
+    export CAUSAL_CONV1D_ROOT=/opt/causal-conv1d
+    export FA_SRC_ROOT=/opt/fa-src
+    # So `import lumi_kernels` works with no install; an editable checkout still wins.
+    export PYTHONPATH=/opt/lumi-jax:${PYTHONPATH:-}
+
+%test
+    . /opt/venv/bin/activate
+    python3 -c "
+import lumi_kernels, os
+d = os.path.join(os.path.dirname(lumi_kernels.__file__), 'lib')
+k = sorted(f for f in os.listdir(d) if f.endswith('.so'))
+print('kernels:', k)
+assert len(k) == 4, k
+"
+
+%labels
+    Description   JAX + the four torch-free FFI kernels (aotriton, flash, sscan, conv1d)
+    BaseImage     {{ BASE }}
+    Recipe        containers/jax-kernels-lean.def
+    Kernels       aotriton flash sscan conv1d
+    NotIncluded   vllm (embeds libtorch)
+    SrcMamba      77069de
+    SrcCausalConv 0d2252d
+
+%help
+    The lean head plus four prebuilt XLA-FFI kernel libraries, at
+    /opt/lumi-jax/lumi_kernels/lib, with no PyTorch anywhere in the image:
+
+        liblumi_aotriton.so   fused attention via standalone AOTriton
+        liblumi_fa_ffi.so     fused attention via standalone CK FMHA
+        liblumi_sscan.so      mamba selective_scan
+        liblumi_conv1d.so     causal_conv1d forward
+
+    The fifth kernel, csrc/vllm's, is NOT here: it embeds libtorch and needs the torch image
+    (lumi-jax-torch-j*-latest.sif).
+
+    Use it:   singularity exec <image> python3 -c "import lumi_kernels; ..."
+    PYTHONPATH already points at /opt/lumi-jax, so no install step is needed.
+
+    To rebuild a kernel while developing, bind your checkout and install it editable in your
+    own venv: its lumi_kernels/lib wins over this one. The sources are in the image --
+    FA_SRC_ROOT=/opt/fa-src, CAUSAL_CONV1D_ROOT=/opt/causal-conv1d, and CK_FMHA_ROOT /
+    AOTRITON_ROOT from the base.

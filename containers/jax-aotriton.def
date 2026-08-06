@@ -1,0 +1,56 @@
+# The lean image plus a standalone AOTriton, so csrc/aotriton is pinned by us rather than by
+# PyTorch, and builds on an image with no torch at all. 0.11.1b is exactly what torch 2.10.0
+# bundles, so this swaps the *source* of AOTriton without moving the ABI.
+#   sbatch containers/build_jax_aotriton.sbatch
+
+# BASE comes via --build-arg from tools/image_name.sh; this def serves both jax lines.
+Bootstrap: localimage
+From: {{ BASE }}
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    AOT_VER=0.11.1b
+    AOT_ROCM=rocm7.0          # matches the base's ROCm 7.0.2
+    AOT_ARCH=amd-gfx90a       # MI250X; LUMI has nothing else
+    BASE="https://github.com/ROCm/aotriton/releases/download/${AOT_VER}"
+
+    mkdir -p /opt/aotriton /tmp/aot
+    cd /tmp/aot
+
+    # The images must land beside the library: AOTriton resolves its store relative to .so.
+    curl -fsSLO "${BASE}/aotriton-${AOT_VER}-manylinux_2_28_x86_64-${AOT_ROCM}-shared.tar.gz"
+    curl -fsSLO "${BASE}/aotriton-${AOT_VER}-images-${AOT_ARCH}.tar.gz"
+    tar xzf "aotriton-${AOT_VER}-manylinux_2_28_x86_64-${AOT_ROCM}-shared.tar.gz" \
+        -C /opt/aotriton --strip-components=1
+    tar xzf "aotriton-${AOT_VER}-images-${AOT_ARCH}.tar.gz" \
+        -C /opt/aotriton --strip-components=1
+    cd / && rm -rf /tmp/aot
+
+    test -e /opt/aotriton/lib/libaotriton_v2.so
+    test -e /opt/aotriton/include/aotriton/flash.h
+    test -d "/opt/aotriton/lib/aotriton.images/${AOT_ARCH}"
+
+    # v3 takes its params struct BY REFERENCE, so a layout change is silent corruption.
+    WANT='aotriton::v3::flash::attn_fwd(aotriton::v3::flash::attn_fwd_params const&, int, aotriton::StreamTemplate<ihipStream_t*>, aotriton::v3::flash::attn_options const*)'
+    nm -DC /opt/aotriton/lib/libaotriton_v2.so | grep -qF "$WANT" \
+        || { echo "FATAL: v3 attn_fwd signature is not what csrc/aotriton expects"; exit 1; }
+
+    # NOT in ld.so.conf: the FFI records an RPATH here, and staying out of the cache keeps
+    # this from shadowing torch's copy where both exist.
+    ldconfig -p | grep -c aotriton || true
+
+    echo "AOTriton ${AOT_VER} (${AOT_ARCH}) installed at /opt/aotriton"
+
+%environment
+    # Read by csrc/aotriton/build_aotriton.sh, which falls back to torch/lib without it.
+    export AOTRITON_ROOT=/opt/aotriton
+
+%labels
+    org.lumi-jax.base       {{ BASE }}
+    org.lumi-jax.aotriton   0.11.1b
+
+%help
+    Lean JAX image (RCCL 2.27.7, no shims) plus standalone AOTriton 0.11.1b for gfx90a.
+    Build csrc/aotriton against it with AOTRITON_ROOT=/opt/aotriton (the default).

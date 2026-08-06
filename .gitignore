@@ -1,0 +1,30 @@
+# venvs
+jax-venv/
+jax-venv-torch/
+
+# install shim + build artifacts
+shim/
+lumi_kernels/lib/*.so
+*.egg-info/
+
+# python
+__pycache__/
+*.pyc
+
+# tooling caches
+.pytest_cache/
+.claude/
+
+# slurm / job output
+*.out
+
+# profiler traces
+
+# crash / core dumps (never commit these)
+core
+core.*
+gpucore.*
+*.core
+
+# site-specific paths (project, scratch cache); never committed
+tools/site.local.sh

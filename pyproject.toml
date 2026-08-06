@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumi-kernels"
+version = "0.1.0"
+description = "Hand-built XLA-FFI kernels for JAX on LUMI MI250X (gfx90a, ROCm)"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+# Deliberately empty: jax/jaxlib + ROCm plugin versions are container-coupled and
+# pinned by install.sh / install-torch.sh. Never let pip resolve them.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["lumi_kernels*"]
+
+[tool.setuptools.package-data]
+lumi_kernels = ["lib/*.so"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "gpu: needs a ROCm GPU (auto-skipped when jax backend != gpu)",
+    "multigpu: needs all 8 GCDs (collectives)",
+    "torch: needs the `torch` image (/opt/venv torch, flash_attn, vllm, causal_conv1d)",
+    "so(name): needs <name>, resolved via lumi_kernels._lib.so_path (image or local build)",
+]

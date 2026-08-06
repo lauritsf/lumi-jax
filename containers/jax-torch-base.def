@@ -1,0 +1,188 @@
+# Stage 1 of the full line: JAX on the LAIF full layer, no kernels. Split from stage 2
+# (jax-torch-kernels.def) so iterating on kernels never re-runs apt, the RCCL download or
+# pip -- this stage is everything that changes when the *base* changes.
+#   sbatch containers/build_jax_torch_base.sbatch
+#
+# RCCL IS NOT A LEAF HERE: libtorch* link librccl.so.1 too, so replacing RCCL changes
+# torch's collectives as well as JAX's; %post asserts both resolve the new library.
+
+# BASE is the LAIF full layer, supplied via --build-arg from tools/image_name.sh.
+Bootstrap: localimage
+From: {{ BASE }}
+
+%files
+    csrc /opt/lumi-jax/csrc
+    lumi_kernels /opt/lumi-jax/lumi_kernels
+    pyproject.toml /opt/lumi-jax/pyproject.toml
+    LICENSE /opt/lumi-jax/LICENSE
+    {{ FA_SRC }}/mamba/csrc/selective_scan /opt/fa-src/mamba/csrc/selective_scan
+    {{ FA_SRC }}/causal-conv1d/csrc /opt/fa-src/causal-conv1d/csrc
+    {{ FA_SRC }}/flash-attention /opt/fa-src/flash-attention
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    # %files preserves source modes, and fa-src trees have arrived 0770 root:root.
+    chmod -R a+rX /opt/fa-src /opt/lumi-jax
+
+    # %files copied the builder's checkout, which on any machine that has run a local
+    # csrc/*/build_*.sh carries stale .so files. Stage 1 builds no kernels, so anything
+    # here came from the submitter -- and stage 2's `test -s` would accept it.
+    rm -f /opt/lumi-jax/lumi_kernels/lib/*.so
+    rm -rf /opt/lumi-jax/lumi_kernels/__pycache__ /opt/lumi-jax/csrc/*/__pycache__
+
+    # --- shim 1: libdw (absent from this image too) ---
+    apt-get update
+    apt-get install -y --no-install-recommends libdw1t64
+    rm -rf /var/lib/apt/lists/*
+
+    # --- shim 2: librocm_smi64 soname ---
+    # In a trusted default dir, not beside the real library: ldconfig indexes by ELF SONAME.
+    ln -sf /opt/rocm/lib/librocm_smi64.so.7 /usr/lib/x86_64-linux-gnu/librocm_smi64.so.1
+    ldconfig
+    python3 -c "import ctypes; ctypes.CDLL('librocm_smi64.so.1'); print('librocm_smi64.so.1 loads')"
+
+    # --- shim 3: RCCL 2.27.7, replacing 2.26.6 in place, because DT_RUNPATH beats the
+    # cache. From the .deb, not apt, which pulled 44 ROCm 7.1 packages over the 7.0.2 base.
+    RCCL_DEB=rccl_2.27.7.70100-20~24.04_amd64.deb
+    cd /tmp
+    curl -fsSLO "https://repo.radeon.com/rocm/apt/7.1/pool/main/r/rccl/$RCCL_DEB"
+    mkdir -p /tmp/rccl-unpack
+    dpkg-deb -x "$RCCL_DEB" /tmp/rccl-unpack
+    rm -f "$RCCL_DEB"
+    ROCM_LIB="$(dirname "$(readlink -f /opt/rocm/lib/librccl.so.1)")"
+    SRC="$(dirname "$(find /tmp/rccl-unpack -name 'librccl.so.*' -type f | head -1)")"
+    test -n "$SRC"
+    rm -f "$ROCM_LIB"/librccl.so.1.0.* "$ROCM_LIB"/librccl.so.1 "$ROCM_LIB"/librccl.so
+    cp -a "$SRC"/librccl.so.[0-9]* "$ROCM_LIB"/
+    for d in msccl-algorithms msccl-unit-test-algorithms rccl-algorithms; do
+        [ -d "$SRC/$d" ] && cp -a "$SRC/$d" "$ROCM_LIB"/ || true
+    done
+    rm -rf /tmp/rccl-unpack
+    RCCL_SO="$(find "$ROCM_LIB" -maxdepth 1 -name 'librccl.so.[0-9]*' -type f | head -1)"
+    test -n "$RCCL_SO"
+    ldconfig
+    ln -sf "$(basename "$RCCL_SO")" "$ROCM_LIB/librccl.so"
+    WANT="$(basename "$RCCL_SO")"
+    test ! -e "$ROCM_LIB/librccl.so.1.0.70002" || { echo "FATAL: 2.26.6 still present"; exit 1; }
+
+    nm -D --defined-only "$RCCL_SO" | grep -E 'ncclCommWindow(Register|Deregister)' \
+        || { echo "FATAL: ncclCommWindowRegister/Deregister missing"; exit 1; }
+
+    # RCCL 2.27 wants the upstream NCCL plugin names, the base ships only the RCCL ones, and
+    # a miss silently drops Slingshot for TCP, with correct results.
+    PLUGIN_DIR="$(dirname "$(readlink -f /lib/x86_64-linux-gnu/librccl-net.so)")"
+    for n in net tuner profiler; do
+        [ -e "$PLUGIN_DIR/librccl-$n.so" ] \
+            && ln -sf "$PLUGIN_DIR/librccl-$n.so" "$PLUGIN_DIR/libnccl-$n.so" || true
+    done
+    ldconfig
+    test -e "$PLUGIN_DIR/libnccl-net.so" || { echo "FATAL: no libnccl-net.so"; exit 1; }
+
+    # --system-site-packages plus the .pth puts torch, vllm etc. in JAX's interpreter.
+    python3 -m venv /opt/jax-venv --system-site-packages
+    echo /opt/venv/lib/python3.12/site-packages \
+        > /opt/jax-venv/lib/python3.12/site-packages/_optvenv.pth
+    . /opt/jax-venv/bin/activate
+    pip install --no-cache-dir --upgrade pip
+
+    # Carried on every pip call, or flax/orbax resolve jax to 0.11.0 and its missing symbol.
+    cat > /opt/jax-venv/lumi-jax-constraints.txt <<'EOF'
+jax==0.9.1
+jaxlib==0.9.1
+jax-rocm7-plugin==0.9.1.post5
+jax-rocm7-pjrt==0.9.1.post5
+EOF
+    PIP="pip install --no-cache-dir -c /opt/jax-venv/lumi-jax-constraints.txt"
+    $PIP 'jax==0.9.1' 'jax-rocm7-plugin==0.9.1.post5' 'jax-rocm7-pjrt==0.9.1.post5'
+    # ray[tune] goes in at the leaf: here it forces a rebuild of every rung above.
+    #
+    # The rest matches jax.def's list, so both products import the same set. Into
+    # /opt/jax-venv, never /opt/venv: anything installed here precedes LAIF's torch env on
+    # sys.path, so resolving these deps is what can move numpy/protobuf/pydantic under torch
+    # and vllm. Pinned versions cannot say that happened -- compare the consumers instead.
+    TORCH_VLLM_BEFORE="$(python3 -c 'import importlib.metadata as m; print(m.version("torch"), m.version("vllm"))')"
+    $PIP flax optax orbax-checkpoint grain chex jaxtyping pytest
+    TORCH_VLLM_AFTER="$(python3 -c 'import importlib.metadata as m; print(m.version("torch"), m.version("vllm"))')"
+    [ "$TORCH_VLLM_BEFORE" = "$TORCH_VLLM_AFTER" ] || {
+        echo "FATAL: the jax stack moved torch/vllm: $TORCH_VLLM_BEFORE -> $TORCH_VLLM_AFTER"
+        exit 1
+    }
+
+    python3 - <<'EOF'
+import importlib.metadata as md
+for pkg, want in [("jax", "0.9.1"), ("jaxlib", "0.9.1"),
+                  ("jax-rocm7-plugin", "0.9.1.post5"), ("jax-rocm7-pjrt", "0.9.1.post5")]:
+    got = md.version(pkg)
+    assert got == want, f"FATAL: {pkg} is {got}, expected {want}"
+    print(f"pin ok: {pkg}=={got}")
+
+# Imported, not just resolved: a shadowed transitive dep breaks the import, not the metadata.
+import flax, optax, orbax.checkpoint, grain, chex, jaxtyping, torch
+for pkg in ("flax", "optax", "orbax-checkpoint", "grain", "chex", "jaxtyping"):
+    print(f"ecosystem ok: {pkg}=={md.version(pkg)}")
+assert torch.__version__.startswith("2.10.0"), torch.__version__
+EOF
+
+    # Through the consumers (plugin, then torch), not the cache: DT_RUNPATH is searched
+    # first, so a cache entry alone does not say which library they load.
+    PLUGIN="$(python3 -c 'import jax_plugins.xla_rocm7 as m, os; print(os.path.join(os.path.dirname(m.__file__), "xla_rocm_plugin.so"))')"
+    test -f "$PLUGIN"
+    PLUGIN_RCCL="$(ldd "$PLUGIN" | awk '/librccl\.so\.1 =>/ {print $3; exit}')"
+    echo "plugin loads rccl from: $PLUGIN_RCCL -> $(readlink -f "$PLUGIN_RCCL")"
+    [ "$(basename "$(readlink -f "$PLUGIN_RCCL")")" = "$WANT" ] \
+        || { echo "FATAL: plugin loads $(readlink -f "$PLUGIN_RCCL"), want $WANT"; exit 1; }
+    if ldd -r "$PLUGIN" 2>&1 | grep 'ncclCommWindow'; then
+        echo "FATAL: plugin has unresolved ncclCommWindow* symbols"; exit 1
+    fi
+
+    for t in libtorch.so libtorch_hip.so; do
+        TL="/opt/venv/lib/python3.12/site-packages/torch/lib/$t"
+        [ -f "$TL" ] || continue
+        TL_RCCL="$(ldd "$TL" | awk '/librccl\.so\.1 =>/ {print $3; exit}')"
+        echo "$t loads rccl from: $(readlink -f "$TL_RCCL")"
+        [ "$(basename "$(readlink -f "$TL_RCCL")")" = "$WANT" ] \
+            || { echo "FATAL: $t does not resolve the new RCCL"; exit 1; }
+    done
+
+%environment
+    export PATH=/opt/jax-venv/bin:$PATH
+
+    # Singularity appends to the base's environment, so a stale stub LD_PRELOAD survives.
+    case "${LD_PRELOAD:-}" in
+        *librccl_window_stub.so*) unset LD_PRELOAD ;;
+    esac
+    unset NCCL_WIN_ENABLE
+
+    # Deliberately NOT set: NCCL_NET_GDR_LEVEL (multi-node hangs) and the FI_* mitigations.
+
+%test
+    . /opt/jax-venv/bin/activate
+    python3 -c "import jax; print('jax', jax.__version__)"
+    python3 -c "import torch; print('torch', torch.__version__)"
+
+%labels
+    Description   JAX on the LAIF full layer, shim-free (stage 1: no kernels)
+    JAX           0.9.1
+    JAXPlugin     0.9.1.post5
+    BaseImage     lumi-multitorch-full-u24r70f21m50t210-20260513_121430
+    ROCm          7.0.2
+    RCCL          2.27.7 (ROCm 7.1 package, replaces 2.26.6)
+    SrcMamba      77069de
+    SrcCausalConv 0d2252d
+    SrcFlashAttn  bbe25ba
+
+%help
+    JAX 0.9.1 for MI250X (gfx90a) on ROCm 7.0.2, on the LAIF full image, with RCCL 2.27.7
+    and no shims. Stage 1: no kernels.
+
+    Kernel sources are in the image at /opt/lumi-jax and /opt/fa-src, so kernels can be
+    rebuilt inside it with FA_SRC_ROOT=/opt/fa-src.
+
+    RCCL is not a leaf here -- torch links it too. Gate multi-node behaviour with
+    containers/test_jax_rccl_multinode.sbatch <this image>, which fails if RCCL falls back
+    to NET/Socket.
+
+    Run with:
+      module use /appl/local/laifs/modules && module load lumi-aif-singularity-bindings

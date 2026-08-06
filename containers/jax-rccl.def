@@ -1,0 +1,134 @@
+# The lean image with RCCL 2.27+ instead of the window-API stub.
+#   sbatch containers/build_jax_rccl.sbatch
+#
+# A leaf change: JAX is the only RCCL consumer on this base. Installed by *unpacking the
+# .deb*, since apt from the 7.1 repo pulls 44 packages onto a 7.0.2 base even pinned to rccl.
+
+# BASE comes via --build-arg from tools/image_name.sh.
+Bootstrap: localimage
+From: {{ BASE }}
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    RCCL_DEB=rccl_2.27.7.70100-20~24.04_amd64.deb
+    cd /tmp
+    curl -fsSLO "https://repo.radeon.com/rocm/apt/7.1/pool/main/r/rccl/$RCCL_DEB"
+    mkdir -p /tmp/rccl-unpack
+    dpkg-deb -x "$RCCL_DEB" /tmp/rccl-unpack
+    rm -f "$RCCL_DEB"
+
+    # REPLACES the old file: a separate dir plus ld.so.conf loses to the plugin's DT_RUNPATH,
+    # and repointing librccl.so.1 loses to ldconfig, which recreates it from the SONAME.
+    ROCM_LIB="$(dirname "$(readlink -f /opt/rocm/lib/librccl.so.1)")"
+    SRC="$(dirname "$(find /tmp/rccl-unpack -name 'librccl.so.*' -type f | head -1)")"
+    test -n "$SRC"
+
+    # Library only; the msccl/rccl algorithm XML is looked up relative to it.
+    rm -f "$ROCM_LIB"/librccl.so.1.0.* "$ROCM_LIB"/librccl.so.1 "$ROCM_LIB"/librccl.so
+    cp -a "$SRC"/librccl.so.[0-9]* "$ROCM_LIB"/
+    for d in msccl-algorithms msccl-unit-test-algorithms rccl-algorithms; do
+        [ -d "$SRC/$d" ] && cp -a "$SRC/$d" "$ROCM_LIB"/ || true
+    done
+    rm -rf /tmp/rccl-unpack
+
+    RCCL_DIR="$ROCM_LIB"
+    RCCL_SO="$(find "$ROCM_LIB" -maxdepth 1 -name 'librccl.so.[0-9]*' -type f | head -1)"
+    test -n "$RCCL_SO"
+    echo "rccl installed at: $RCCL_SO"
+
+    # ldconfig makes librccl.so.1 from the SONAME; the link-time librccl.so it ignores.
+    ldconfig
+    ln -sf "$(basename "$RCCL_SO")" "$ROCM_LIB/librccl.so"
+    ls -la "$ROCM_LIB"/librccl.so*
+
+    # --- verify, four ways; against the resolved *file*, since old and new share a dir ---
+    WANT="$(basename "$RCCL_SO")"          # librccl.so.1.0.70100
+    test ! -e "$ROCM_LIB/librccl.so.1.0.70002" || {
+        echo "FATAL: the 2.26.6 library is still present"; exit 1; }
+
+    RESOLVED="$(ldconfig -p | awk '$1 == "librccl.so.1" {print $NF; exit}')"
+    echo "librccl.so.1 -> $RESOLVED -> $(readlink -f "$RESOLVED")"
+    [ "$(basename "$(readlink -f "$RESOLVED")")" = "$WANT" ] \
+        || { echo "FATAL: librccl.so.1 resolves to $(readlink -f "$RESOLVED"), want $WANT"; exit 1; }
+
+    # ...and the plugin: the cache alone is not enough, since its DT_RUNPATH is searched
+    # first and can still reach a 2.26.6 left elsewhere.
+    PLUGIN=/opt/venv/lib/python3.12/site-packages/jax_plugins/xla_rocm7/xla_rocm_plugin.so
+    test -f "$PLUGIN"
+    PLUGIN_RCCL="$(ldd "$PLUGIN" | awk '/librccl\.so\.1 =>/ {print $3; exit}')"
+    echo "plugin loads rccl from: $PLUGIN_RCCL -> $(readlink -f "$PLUGIN_RCCL")"
+    [ "$(basename "$(readlink -f "$PLUGIN_RCCL")")" = "$WANT" ] \
+        || { echo "FATAL: plugin loads $(readlink -f "$PLUGIN_RCCL"), want $WANT"; exit 1; }
+    if ldd -r "$PLUGIN" 2>&1 | grep 'ncclCommWindow'; then
+        echo "FATAL: plugin has unresolved ncclCommWindow* symbols"
+        exit 1
+    fi
+
+    # 2. the window API -- the point of this image; the base's RCCL exports none of it.
+    NWIN="$(nm -D --defined-only "$RESOLVED" | grep -c 'ncclCommWindow' || true)"
+    echo "ncclCommWindow* symbols: $NWIN"
+    [ "$NWIN" -gt 0 ] || { echo "FATAL: no ncclCommWindow* symbols in $RESOLVED"; exit 1; }
+    nm -D --defined-only "$RESOLVED" | grep -E 'ncclCommWindow(Register|Deregister)' \
+        || { echo "FATAL: ncclCommWindowRegister/Deregister missing"; exit 1; }
+
+    # 3. still resolves against 7.0.2: the leaf risk is a 7.1-only hsa/hip symbol.
+    if ldd -r "$RESOLVED" 2>&1 | grep -E 'undefined symbol|not found'; then
+        echo "FATAL: unresolved symbols in $RESOLVED against the 7.0.2 runtime"
+        exit 1
+    fi
+    python3 -c "import ctypes; ctypes.CDLL('librccl.so.1'); print('librccl.so.1 loads')"
+
+    # --- keep the Slingshot network plugin loadable ---
+    # RCCL 2.27 looks its net plugin up under the upstream NCCL names and the base ships
+    # aws-ofi only under the RCCL ones; a miss silently drops NET/OFI for TCP.
+    PLUGIN_DIR="$(dirname "$(readlink -f /lib/x86_64-linux-gnu/librccl-net.so)")"
+    for n in net tuner profiler; do
+        [ -e "$PLUGIN_DIR/librccl-$n.so" ] \
+            && ln -sf "$PLUGIN_DIR/librccl-$n.so" "$PLUGIN_DIR/libnccl-$n.so" || true
+    done
+    ldconfig
+    ls -la "$PLUGIN_DIR"/libnccl-*.so
+    test -e "$PLUGIN_DIR/libnccl-net.so" || { echo "FATAL: no libnccl-net.so"; exit 1; }
+
+    # Deleted, not just un-preloaded: a leftover file plus a stale LD_PRELOAD reinstates it.
+    rm -f /opt/lumi-shim/librccl_window_stub.so /opt/lumi-shim/rccl_window_stub.c
+    rmdir /opt/lumi-shim 2>/dev/null || true
+
+%environment
+    export PATH=/opt/venv/bin:$PATH
+
+    # Singularity *appends* to the base's environment, so the base's stub preload arrives
+    # still set, pointing at a file %post has deleted.
+    case "${LD_PRELOAD:-}" in
+        *librccl_window_stub.so*) unset LD_PRELOAD ;;
+    esac
+    unset NCCL_WIN_ENABLE
+
+    # Deliberately NOT set: NCCL_NET_GDR_LEVEL (multi-node hangs) or the FI_* mitigations.
+
+%test
+    . /opt/venv/bin/activate
+    python3 -c "import jax; d = jax.devices(); print('devices:', len(d)); assert len(d) >= 1"
+
+%labels
+    Description  JAX on the LAIF mpich layer, shim-free, RCCL 2.27+ (no window-API stub)
+    JAX          0.9.1
+    JAXPlugin    0.9.1.post5
+    BaseImage    {{ BASE }} (containers/jax.def)
+    ROCm         7.0.2
+    RCCL         2.27.7 (ROCm 7.1 package, leaf upgrade)
+
+%help
+    JAX 0.9.1 for MI250X (gfx90a) on ROCm 7.0.2, with RCCL 2.27.7 from ROCm 7.1 replacing
+    the base's 2.26.6.
+
+    No shims of any kind: no libdw from Cray PE, no librocm_smi64 soname link on the host,
+    no RCCL window-API stub. Run it with no LD_PRELOAD and no shim dir on LD_LIBRARY_PATH.
+
+    Multi-node psum is validated by containers/test_jax_rccl_multinode.sbatch -- do not trust
+    this image for multi-node work without that job's output.
+
+    Do not set NCCL_NET_GDR_LEVEL. For hangs, try FI_CXI_DISABLE_HOST_REGISTER=1 and
+    FI_MR_CACHE_MONITOR=userfaultfd at runtime.

@@ -1,0 +1,66 @@
+# The AOTriton lean image plus standalone CK FMHA, so csrc/flash stops needing torch:
+# flash_attn_2_cuda.so is a PyTorch extension hard-linking libc10/libtorch_*, so one kernel
+# dragged ~1 GB of libtorch into any image wanting fused attention.
+#   bash tools/build_ck_fmha.sh          # or: sbatch containers/build_ck_fmha.sbatch
+#   sbatch containers/build_jax_ck_fmha.sbatch
+#
+# Built OUTSIDE this def and copied in by %files: ~2700 hipcc invocations against PRoot's
+# ~4x overhead would turn a 15-minute job into an hour. It also ships the WHOLE CK SOURCE
+# SURFACE (~28 MB), so all 27 CK kernels stay buildable without rebuilding this image.
+
+# BASE comes via --build-arg from tools/image_name.sh; this def serves both jax lines.
+Bootstrap: localimage
+From: {{ BASE }}
+
+%files
+    {{ CK_FMHA_SRC }}/lib/libck_fmha.so /opt/ck-fmha/lib/libck_fmha.so
+    {{ CK_FMHA_SRC }}/include /opt/ck-fmha/include
+    {{ CK_FMHA_SRC }}/src /opt/ck-fmha/src
+
+%post
+    set -eux
+
+    # %files preserves source modes, and vendored sources have shipped 0770 root:root.
+    chmod -R a+rX /opt/ck-fmha
+
+    test -e /opt/ck-fmha/lib/libck_fmha.so
+    test -e /opt/ck-fmha/include/fmha_fwd.hpp
+    test -d /opt/ck-fmha/include/ck_tile
+    test -d /opt/ck-fmha/src/15_fused_moe
+
+    # A libck_fmha.so that picked up libtorch works on the full image and fails only here.
+    if readelf -d /opt/ck-fmha/lib/libck_fmha.so | grep -qE 'NEEDED.*(torch|c10)'; then
+        echo "FATAL: libck_fmha.so links libtorch"; exit 1
+    fi
+
+    # fmha_bwd is a template instantiation (`float fmha_bwd<2>(...)`), so a pattern without
+    # the argument list fails a good build.
+    for s in fmha_fwd fmha_bwd fmha_fwd_splitkv fmha_fwd_appendkv; do
+        nm -DC /opt/ck-fmha/lib/libck_fmha.so \
+            | grep -qE " T (float )?${s}(<[0-9]+>)?\(" \
+            || { echo "FATAL: ${s} not exported"; exit 1; }
+    done
+
+    # NOT in ld.so.conf, as with AOTriton: the FFI records an RPATH here, and the cache
+    # would shadow torch's copy.
+    echo "CK FMHA installed at /opt/ck-fmha"
+
+%environment
+    # Read by csrc/flash/build_ffi.sh, which falls back to flash_attn_2_cuda.so without it.
+    export CK_FMHA_ROOT=/opt/ck-fmha
+
+%labels
+    org.lumi-jax.base      {{ BASE }}
+    org.lumi-jax.ck_fmha   receipt2-gfx90a-6api
+
+%help
+    Lean JAX image (RCCL 2.27.7, standalone AOTriton) plus standalone CK FMHA: fused
+    attention with no torch anywhere. Build csrc/flash with CK_FMHA_ROOT=/opt/ck-fmha
+    (the default).
+
+    /opt/ck-fmha/src carries all 27 ck_tile example sources and /opt/ck-fmha/include both
+    ck_tile and the classic ck/ tree, so other CK kernels can be built against this image
+    without rebuilding it -- but check the architecture first. LUMI is gfx90a, and four
+    examples are gated above it (15_fused_moe, 17_grouped_gemm, 18_flatmm): they use
+    hand-written assembly emitting v_mfma_f32_16x16x16_bf16, which gfx90a rejects. Read the
+    example's CMakeLists.txt gate before estimating any binding work.
