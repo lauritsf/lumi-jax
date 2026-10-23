@@ -19,7 +19,7 @@ set -euo pipefail
 
 REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 source "$REPO_DIR/tools/image_name.sh"
-OUT="${OUT:-${LUMI_JAX_WORK:?set it, or create tools/site.local.sh}/ck-fmha}"
+OUT="${OUT:-${BUILD_ARTIFACT_DIR:?set LUMI_JAX_WORK}/ck-fmha}"
 
 module purge
 module use /appl/local/laifs/modules

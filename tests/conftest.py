@@ -3,13 +3,11 @@
 Markers (declared in pyproject):
   gpu       -- requires a ROCm GPU backend
   multigpu  -- requires all 8 GCDs (LUMI-G node)
-  torch     -- requires the `torch` image (/opt/venv torch, flash_attn, vllm, ...)
   so(name)  -- requires <name>, resolved the same way the kernels themselves resolve it
 
-Tests must never fail at COLLECTION off-GPU/off-container -- import gpu/torch
+Tests must never fail at COLLECTION off-GPU/off-container -- import GPU
 deps lazily inside fixtures or test functions.
 """
-import importlib.util
 import os
 import sys
 
@@ -56,14 +54,11 @@ def _gpu_count():
 
 def pytest_collection_modifyitems(config, items):
     ngpu = _gpu_count()
-    has_torch = importlib.util.find_spec("torch") is not None
     for item in items:
         if item.get_closest_marker("gpu") and ngpu == 0:
             item.add_marker(pytest.mark.skip(reason="no ROCm GPU backend"))
         if item.get_closest_marker("multigpu") and ngpu < 8:
             item.add_marker(pytest.mark.skip(reason=f"needs 8 GCDs, have {ngpu}"))
-        if item.get_closest_marker("torch") and not has_torch:
-            item.add_marker(pytest.mark.skip(reason="torch not importable (needs the torch image)"))
         m = item.get_closest_marker("so")
         if m and not _so_available(m.args[0]):
             item.add_marker(pytest.mark.skip(

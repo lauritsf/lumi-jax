@@ -6,12 +6,10 @@ professional. Optimize for the reader's time.
 ## Repo map
 
 ```
-install.sh / install-torch.sh    build ./jax-venv (lean image) / ./jax-venv-torch (torch image);
-                                 the venvs layer over the image's /opt/venv
-activate.sh / activate-torch.sh  enter those venvs inside the container
+install.sh / activate.sh        install and enter $LUMI_JAX_WORK/jax-venv over /opt/venv
 lumi_kernels/                    the Python package users import; lib/ holds built .so files (gitignored)
-csrc/                            HIP sources + per-kernel build scripts, hipBLASLt/RCCL stubs, torch-header shims
-tests/                           pytest suite (markers gpu/multigpu/torch/so(name) auto-skip);
+csrc/                            CK attention HIP sources and build script
+tests/                           pytest suite (markers gpu/multigpu/so(name) auto-skip);
                                  slurm/ holds the test gates
 containers/                      .def + build_*.sbatch per image variant, test_*.sbatch acceptance gates
 tools/                           resolve_image.sh picks image + pip pins from one knob;
@@ -24,11 +22,13 @@ Images live outside the repo, under `$LUMI_JAX_WORK/images/`.
 ## Verifying changes
 
 - The gates, submitted from the repo root: `sbatch tests/slurm/run-tests-base.sbatch`
-  (lean image, 8 GCDs) and `sbatch tests/slurm/run-tests-full.sbatch` (torch image,
-  1 GCD). Both need `SBATCH_ACCOUNT` set and end with `... OK` on success.
+  (lean image, 8 GCDs). Set `SBATCH_ACCOUNT`; success ends with `BASE SUITE OK`.
 - After a container rebuild, run the matching `containers/test_*.sbatch` acceptance gate.
-- Off-GPU, `pytest tests -q` in the venv collects cleanly but auto-skips everything with a
-  missing prerequisite; it verifies pure-JAX code only.
+- Off-GPU, `pytest tests -q` in the venv collects cleanly and runs host tests; device
+  tests skip missing prerequisites. A GPU gate must check its devices explicitly.
+- Builds and gates outlive a session, so a clean tree is not a verified one. Start with
+  `git log -1` and `squeue -u $USER`: a session that left work running lists the job
+  numbers and what each must show in the newest commit body.
 
 ## Repo invariants
 
@@ -42,9 +42,10 @@ Images live outside the repo, under `$LUMI_JAX_WORK/images/`.
 
 ## Documentation
 
+- Use plain language: say "tests" instead of "qualification".
+
 - Every sentence must change what the reader does next; delete it otherwise.
-- `README.md` is the only top-level document (besides this file and its `CLAUDE.md`
-  symlink). Never create additional Markdown files
+- `README.md` and `AGENTS.md` are the only top-level documents. Never create additional Markdown files
   (STATUS.md, CONTAINER.md, NOTES.md, TODO.md, design docs, handoffs). Kernel-local build
   notes may live in `csrc/<kernel>/README.md`.
 - Document the present, not the past. No history, dead ends, deprecated paths, retractions,

@@ -1,194 +1,32 @@
-# JAX retarget layer: move any of our images to a newer jax, adding the hipBLASLt stub that
-# newer plugins need on ROCm 7.0.2.
-#   sbatch --export=ALL,VARIANT=rccl,JAXVER=0.11.0 containers/build_jax_version.sbatch
-#
-# jax 0.9.2+ references hipblaslt_ext::GemmInstance::setMaxWorkspaceBytes, absent from ROCm
-# 7.0.2; 0.10.2+ bind it lazily, so csrc/hipblaslt_gemm_instance_stub.cpp defines it as a
-# loud no-op. Cost: a ~14x XLA GEMM autotune sweep, fixed by a cache (see %help). ROCm 7.1's
-# libhipblaslt is not an alternative: it needs 7.1's librocroller, and the pair wedges here.
-# VENVDIR (from the build script) names WHICH VENV HOLDS JAX per variant; wrong leaves two
-# jax trees in one interpreter with 0.9.1 first on sys.path. Safe on `torch-base` only.
+# Retarget a kernel-free stage while retaining the native ROCm libraries.
 Bootstrap: localimage
 From: {{ BASE }}
 
 %files
-    # Paths are relative to the build's working directory (the repo root) -- not `../`.
-    csrc/hipblaslt_gemm_instance_stub.cpp /opt/lumi-stub/hipblaslt_gemm_instance_stub.cpp
-    # Shared with install.sh, which must install the same hook into its layered venv.
-    tools/install_allreduce_hook.sh /opt/lumi-stub/install_allreduce_hook.sh
+    tools/verify_native_rocm.sh /opt/lumi-jax-tools/verify_native_rocm.sh
+    tools/install_jax_stack.sh /opt/lumi-jax-tools/install_jax_stack.sh
+    tools/install_xla_flags_hook.sh /opt/lumi-jax-tools/install_xla_flags_hook.sh
 
 %post
     set -eux
-
-    # A real .so on the loader path, not LD_PRELOAD every job script has to remember to set.
-    g++ -shared -fPIC -O2 -Wl,-soname,liblumi_hipblaslt_stub.so.1 \
-        -o /opt/rocm/lib/liblumi_hipblaslt_stub.so.1 \
-        /opt/lumi-stub/hipblaslt_gemm_instance_stub.cpp
-    ln -sf liblumi_hipblaslt_stub.so.1 /opt/rocm/lib/liblumi_hipblaslt_stub.so
-    ldconfig
-
-    nm -D --defined-only /opt/rocm/lib/liblumi_hipblaslt_stub.so.1 \
-        | grep -q '_ZN13hipblaslt_ext12GemmInstance20setMaxWorkspaceBytesEm' \
-        || { echo "FATAL: stub does not define the mangled symbol"; exit 1; }
-
-    # Something must pull the stub in, or a lazily-bound call still finds nothing.
-    {{ VENVDIR }}/bin/pip install --no-cache-dir patchelf
-    PATCHELF={{ VENVDIR }}/bin/patchelf
-
-    HB="$(readlink -f /opt/rocm/lib/libhipblaslt.so.1)"
-
-    # THE BACKUP GOES OUTSIDE THE LIBRARY DIRECTORY: ldconfig regenerates soname symlinks
-    # from each scanned file's SONAME, so a backup beside the original silently wins.
-    cp -a "$HB" /opt/lumi-stub/libhipblaslt.so.1.0.70002.orig
-    "$PATCHELF" --add-needed liblumi_hipblaslt_stub.so.1 "$HB" \
-        || { echo "FATAL: patchelf --add-needed failed"; exit 1; }
-    readelf -d "$HB" | grep -E 'NEEDED.*lumi_hipblaslt_stub' \
-        || { echo "FATAL: the stub is not in libhipblaslt's NEEDED list"; exit 1; }
-    ldconfig
-
-    RESOLVED="$(readlink -f /opt/rocm/lib/libhipblaslt.so.1)"
-    [ "$RESOLVED" = "$HB" ] || {
-        echo "FATAL: libhipblaslt.so.1 now resolves to $RESOLVED, not the patched $HB"
-        exit 1
-    }
-
-    . {{ VENVDIR }}/bin/activate
-
-    # Replaced wholesale: leaving 0.9.1 in makes the resolve unsatisfiable, dropping the
-    # file lets flax/orbax move jax. Quoted heredoc; --build-arg substitution is textual.
-    cat > {{ VENVDIR }}/lumi-jax-constraints.txt <<'EOF'
-jax=={{ JAXVER }}
-jaxlib=={{ JAXVER }}
-jax-rocm7-plugin=={{ JAXVER }}
-jax-rocm7-pjrt=={{ JAXVER }}
-EOF
-    PIP="pip install --no-cache-dir -c {{ VENVDIR }}/lumi-jax-constraints.txt"
-
-    $PIP --upgrade 'jax=={{ JAXVER }}' 'jaxlib=={{ JAXVER }}' \
-                   'jax-rocm7-plugin=={{ JAXVER }}' 'jax-rocm7-pjrt=={{ JAXVER }}'
-
-    # pjrt is the 505 MB backend, so the unpinned half is the one that matters.
-    python3 - <<'PY'
-import importlib.metadata as md
-want = "{{ JAXVER }}"
-for p in ("jax", "jaxlib", "jax-rocm7-plugin", "jax-rocm7-pjrt"):
-    got = md.version(p)
-    print(f"{p:<20} {got}")
-    assert got == want, f"{p} is {got}, want {want}"
-PY
-
-    # Reinstalled, not inherited: the retarget resolves these against the new jax. Keep the
-    # list identical to jax.def's, or a retargeted image quietly loses a package.
-    #
-    # On `stage-torch` these land in /opt/jax-venv, ahead of LAIF's torch env on sys.path, so
-    # resolving their deps can move numpy/protobuf/pydantic under torch and vllm. Pinned jax
-    # versions cannot show that; compare the consumers. Reports `absent` on the lean variants.
-    tv() { python3 -c 'import importlib.metadata as m
-try:
-    print(m.version("torch"), m.version("vllm"))
-except Exception:
-    print("absent")'; }
-    TORCH_VLLM_BEFORE="$(tv)"
-    $PIP flax optax orbax-checkpoint grain chex jaxtyping pytest
-    [ "$(tv)" = "$TORCH_VLLM_BEFORE" ] || {
-        echo "FATAL: the jax stack moved torch/vllm: $TORCH_VLLM_BEFORE -> $(tv)"
-        exit 1
-    }
-
-    # Dump first, assert after: a one-symbol grep cannot say which link failed.
-    PLUGIN={{ VENVDIR }}/lib/python3.12/site-packages/jax_plugins/xla_rocm7/xla_rocm_plugin.so
-    test -f "$PLUGIN"
-
-    echo "=== stub reachability, as the loader sees it ==============================="
-    HBRES="$(ldd "$PLUGIN" 2>/dev/null | awk '/libhipblaslt\.so/ {print $3; exit}')"
-    echo "plugin resolves libhipblaslt to : ${HBRES:-<UNRESOLVED>}"
-    echo "we patched                      : $HB"
-    ls -l /opt/rocm/lib/liblumi_hipblaslt_stub.so* || echo "  (the stub file is gone)"
-    echo "-- ld.so.cache:"
-    ldconfig -p | grep -E 'lumi_hipblaslt_stub|libhipblaslt' || echo "  (neither is in the cache)"
-    echo "-- does the resolved libhipblaslt pull the stub in?"
-    ldd "${HBRES:-$HB}" 2>&1 | grep -E 'lumi_hipblaslt_stub|not found' \
-        || echo "  (no stub and no missing library in its link map)"
-    echo "-- what the stub exports:"
-    nm -D --defined-only /opt/rocm/lib/liblumi_hipblaslt_stub.so.1 | grep setMaxWorkspaceBytes \
-        || echo "  (nothing matching)"
-    echo "-- everything still unresolved for the plugin:"
-    UNRES="$(ldd -r "$PLUGIN" 2>&1 | grep -E 'undefined symbol|not found' | sort -u | head -40)"
-    echo "${UNRES:-  (nothing -- fully resolved)}"
-    echo "=========================================================================="
-
-    if ldd -r "$PLUGIN" 2>&1 | grep -q 'setMaxWorkspaceBytes'; then
-        echo "FATAL: the symbol is still unresolved for the plugin -- read the dump above"
-        exit 1
-    fi
-    echo "plugin resolves setMaxWorkspaceBytes via the stub"
-
-    # All-reduce workaround (see %help): a .pth hook is the only place that survives, since
-    # %environment loses to caller variables and sitecustomize.py is shadowed. chmod because
-    # %files preserves the source mode.
-    chmod 0755 /opt/lumi-stub/install_allreduce_hook.sh
-    /opt/lumi-stub/install_allreduce_hook.sh \
-        {{ VENVDIR }}/lib/python3.12/site-packages {{ VENVDIR }}/bin/python3
+    chmod -R a+rX /opt/lumi-jax-tools
+    unset PYTHONPATH
+    bash /opt/lumi-jax-tools/verify_native_rocm.sh
+    bash /opt/lumi-jax-tools/install_jax_stack.sh {{ JAXVER }}
 
 %environment
-    export PATH={{ VENVDIR }}/bin:$PATH
-
-    # DELIBERATELY NOT `export XLA_FLAGS=...`: singularity injects caller variables AFTER
-    # this script, so a caller's would replace it. The .pth hook is its only writer.
-    export LUMI_JAX_ALLREDUCE_WORKAROUND="--xla_gpu_unsupported_use_all_reduce_one_shot_kernel=false (applied at python startup; unset with LUMI_JAX_NO_ALLREDUCE_WORKAROUND=1)"
+    export PATH=/opt/venv/bin:$PATH
+    unset PYTHONPATH
 
 %test
-    . {{ VENVDIR }}/bin/activate
-    python3 -c "
-import jax
-print('jax', jax.__version__)
-assert jax.__version__ == '{{ JAXVER }}'
-d = jax.devices(); print('devices:', len(d)); assert len(d) >= 1
-import jax.numpy as jnp, numpy as np
-a = jnp.ones((512, 512)); assert abs(float(jnp.sum(a @ a)) - 512**3) < 1
-print('gemm ok')
-"
+    python3 -c "import jax; print(jax.__version__,jax.devices()); assert jax.__version__ == '{{ JAXVER }}'; assert jax.device_count() >= 1"
 
 %labels
-    Description  JAX {{ JAXVER }} retargeted onto {{ BASE }}, hipBLASLt symbol stubbed
-    JAX          {{ JAXVER }}
-    JAXPlugin    {{ JAXVER }}
-    JAXPjrt      {{ JAXVER }}
-    BaseImage    {{ BASE }}
-    Recipe       containers/jax-version.def
-    ROCm         7.0.2
-    Stub         hipblaslt_ext::GemmInstance::setMaxWorkspaceBytes (no-op, warns on first call)
-    XLAFlags     prepends --xla_gpu_unsupported_use_all_reduce_one_shot_kernel=false
-    XLAFlagsHow  .pth hook at python startup (opt out: LUMI_JAX_NO_ALLREDUCE_WORKAROUND=1)
+    Description JAX {{ JAXVER }} on native ROCm 7.2.4
+    BaseImage {{ BASE }}
+    JAX {{ JAXVER }}
+    ROCm 7.2.4
+    RCCL 2.27.7
 
 %help
-    JAX {{ JAXVER }} for MI250X (gfx90a) on ROCm 7.0.2, retargeted from {{ BASE }}.
-
-    Three caveats, all measured.
-
-    1. THIS IMAGE SETS XLA_FLAGS, at python startup. It prepends
-       --xla_gpu_unsupported_use_all_reduce_one_shot_kernel=false: without it any collective
-       inside one process spanning two or more GCDs hangs forever on gfx90a (jax.pmap and
-       jit+shard_map alike). Multi-node, one GCD per process, is unaffected.
-
-       The image also sets it in %environment, but singularity injects caller variables
-       after that, so your own XLA_FLAGS would replace it wholesale. A .pth hook in the venv's
-       site-packages (zz-lumi-xla-flags.pth) therefore merges the flag into os.environ at
-       interpreter startup and prepends rather than overwrites -- XLA honours the last
-       occurrence of a repeated flag, so your settings still win. Opt out with
-       LUMI_JAX_NO_ALLREDUCE_WORKAROUND=1. Non-Python callers get only the %environment half.
-
-    2. THE STUB. ROCm 7.0.2 does not define
-       hipblaslt_ext::GemmInstance::setMaxWorkspaceBytes, so this image supplies a no-op stub
-       that warns if it is ever called. No probed workload reaches it. If you see that
-       warning, the image needs a ROCm 7.1+ base instead of a stub -- please report it.
-
-    3. THE AUTOTUNE SWEEP. On a large f32 GEMM (32768^2) the XLA GEMM autotune sweep costs
-       ~1350 s here against ~35 s under 0.9.1. Fix it with a persisted cache:
-
-         XLA_FLAGS="--xla_gpu_per_fusion_autotune_cache_dir=/some/writable/dir"
-
-       1319 s -> 3.1 s warm, throughput unchanged at ~41 TFLOP/s. Entries are keyed per
-       fusion, so it is "pay once per distinct shape" -- a program with many shapes may pay
-       repeatedly, which is untested. Do NOT use --xla_gpu_autotune_level=0: it buys the
-       compile time back and costs 8x throughput.
+    This stage swaps JAX pins in /opt/venv without patching ROCm libraries.

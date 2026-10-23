@@ -1,6 +1,4 @@
-"""ALiBi slopes through the FFI -- the one capability with no prior coverage.
-Validated vs flash_attn_func with alibi_slopes (same CK kernel), fwd + grad,
-(Hq,) and (B,Hq) slope shapes, x causal/window/GQA. Needs the `torch` image."""
+"""CK forward and gradients against an independent float32 JAX reference."""
 import numpy as np
 import pytest
 
@@ -8,8 +6,9 @@ import jax
 import jax.numpy as jnp
 
 from lumi_kernels.attention import flash_ffi as F
+from oracle import attention
 
-pytestmark = [pytest.mark.gpu, pytest.mark.torch, pytest.mark.so("liblumi_fa_ffi.so")]
+pytestmark = [pytest.mark.gpu, pytest.mark.so("liblumi_fa_ffi.so")]
 
 
 def _slopes(Hq, B=None, seed=9):
@@ -21,11 +20,8 @@ def _slopes(Hq, B=None, seed=9):
 
 
 def _run(B, Sq, Sk, Hq, Hk, D, causal, window, per_batch, dtype):
-    import torch
-    from flash_attn import flash_attn_func
 
     jdt = {"bf16": jnp.bfloat16, "fp16": jnp.float16}[dtype]
-    tdt = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
     g = np.random.default_rng(0)
     qn = (g.standard_normal((B, Sq, Hq, D)) * 0.5).astype(np.float32)
     kn = (g.standard_normal((B, Sk, Hk, D)) * 0.5).astype(np.float32)
@@ -42,14 +38,13 @@ def _run(B, Sq, Sk, Hq, Hk, D, causal, window, per_batch, dtype):
     _, vjp = jax.vjp(fn, qj, kj, vj)
     dqj, dkj, dvj = vjp(jnp.asarray(gn).astype(jdt))
 
-    qt, kt, vt = (torch.tensor(x, device="cuda", dtype=tdt, requires_grad=True) for x in (qn, kn, vn))
-    ot = flash_attn_func(qt, kt, vt, softmax_scale=scale, causal=causal, window_size=window,
-                         alibi_slopes=torch.tensor(slopes, device="cuda"))
-    dqt, dkt, dvt = torch.autograd.grad(ot, (qt, kt, vt), torch.tensor(gn, device="cuda", dtype=tdt))
+    ref = lambda q, k, v: attention(q, k, v, causal=causal, scale=scale, window=window, alibi=aj)
+    ot, pullback = jax.vjp(ref, *(x.astype(jnp.float32) for x in (qj, kj, vj)))
+    dqt, dkt, dvt = pullback(jnp.asarray(gn).astype(jdt).astype(jnp.float32))
 
     def err(aj_, bt_):
         return float(np.max(np.abs(np.asarray(aj_, np.float32) -
-                                   bt_.detach().to(torch.float32).cpu().numpy())))
+                                   np.asarray(bt_, np.float32))))
 
     tol = 3e-2 if dtype == "bf16" else 1.5e-2
     assert err(out_j, ot) < tol, "fwd"

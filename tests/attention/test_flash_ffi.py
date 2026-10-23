@@ -1,8 +1,4 @@
-"""Validate the full-feature XLA-FFI binding against flash_attn_func (the
-authoritative torch binding of the same CK kernels) across the capability matrix:
-MHA / single-head / GQA / MQA, causal + non-causal, cross-attention (S_q != S_k),
-sliding-window/local, fp16 + bf16 -- forward and gradients. Needs the `torch` image.
-"""
+"""CK forward and gradients against an independent float32 JAX reference."""
 import numpy as np
 import pytest
 
@@ -10,8 +6,9 @@ import jax
 import jax.numpy as jnp
 
 from lumi_kernels.attention import flash_ffi as F
+from oracle import attention
 
-pytestmark = [pytest.mark.gpu, pytest.mark.torch, pytest.mark.so("liblumi_fa_ffi.so")]
+pytestmark = [pytest.mark.gpu, pytest.mark.so("liblumi_fa_ffi.so")]
 
 JDT = {"bf16": jnp.bfloat16, "fp16": jnp.float16}
 
@@ -21,11 +18,8 @@ def _np(B, S, H, D, seed, dt=np.float32):
     return (g.standard_normal((B, S, H, D)).astype(np.float32) * 0.5).astype(dt)
 
 
-def _vs_torch(B, Sq, Sk, Hq, Hk, D, causal, window, dtype, grad=True):
-    import torch
-    from flash_attn import flash_attn_func
+def _vs_reference(B, Sq, Sk, Hq, Hk, D, causal, window, dtype, grad=True):
 
-    tdt = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
     jdt = JDT[dtype]
     qn, kn, vn, gn = _np(B, Sq, Hq, D, 1), _np(B, Sk, Hk, D, 2), _np(B, Sk, Hk, D, 3), _np(B, Sq, Hq, D, 4)
     scale = 1.0 / D ** 0.5
@@ -37,14 +31,13 @@ def _vs_torch(B, Sq, Sk, Hq, Hk, D, causal, window, dtype, grad=True):
         _, vjp = jax.vjp(lambda q, k, v: jax.jit(fn)(q, k, v), qj, kj, vj)
         dqj, dkj, dvj = vjp(jnp.asarray(gn).astype(jdt))
 
-    qt, kt, vt = (torch.tensor(x, device="cuda", dtype=tdt, requires_grad=grad) for x in (qn, kn, vn))
-    ot = flash_attn_func(qt, kt, vt, softmax_scale=scale, causal=causal, window_size=window)
-    if grad:
-        dqt, dkt, dvt = torch.autograd.grad(ot, (qt, kt, vt), torch.tensor(gn, device="cuda", dtype=tdt))
+    ref = lambda q, k, v: attention(q, k, v, causal=causal, scale=scale, window=window)
+    ot, pullback = jax.vjp(ref, *(x.astype(jnp.float32) for x in (qj, kj, vj)))
+    dqt, dkt, dvt = pullback(jnp.asarray(gn).astype(jdt).astype(jnp.float32))
 
-    def err(a_jax, b_torch):
+    def err(a_jax, expected):
         a = np.asarray(a_jax, np.float32)
-        b = b_torch.detach().to(torch.float32).cpu().numpy()
+        b = np.asarray(expected, np.float32)
         return float(np.max(np.abs(a - b)))
 
     tol = 3e-2 if dtype == "bf16" else 1.5e-2
@@ -71,7 +64,7 @@ CASES = {
 @pytest.mark.parametrize("name", list(CASES))
 def test_vs_flash_attn(name, dtype):
     B, Sq, Sk, Hq, Hk, D, causal, window = CASES[name]
-    _vs_torch(B, Sq, Sk, Hq, Hk, D, causal, window, dtype)
+    _vs_reference(B, Sq, Sk, Hq, Hk, D, causal, window, dtype)
 
 
 def _qkv(B=2, S=512, H=8, D=64, dt=jnp.bfloat16):

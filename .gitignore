@@ -1,6 +1,5 @@
 # venvs
-jax-venv/
-jax-venv-torch/
+jax-venv*/
 
 # install shim + build artifacts
 shim/
@@ -17,8 +16,6 @@ __pycache__/
 
 # slurm / job output
 *.out
-
-# profiler traces
 
 # crash / core dumps (never commit these)
 core

@@ -1,5 +1,5 @@
 """flash_attention_varlen_traced: dynamic (traced) cu_seqlens, compiled ONCE,
-bit-identical fwd+grad to the static flash_attention_varlen_ffi. Needs the `torch` image."""
+bit-identical fwd+grad to the static flash_attention_varlen_ffi."""
 import numpy as np
 import pytest
 
@@ -8,7 +8,7 @@ import jax.numpy as jnp
 
 from lumi_kernels.attention import flash_ffi as F
 
-pytestmark = [pytest.mark.gpu, pytest.mark.torch, pytest.mark.so("liblumi_fa_ffi.so")]
+pytestmark = [pytest.mark.gpu, pytest.mark.so("liblumi_fa_ffi.so")]
 
 H, D, S, DT = 8, 128, 256, jnp.bfloat16
 

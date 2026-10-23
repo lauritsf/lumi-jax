@@ -1,7 +1,4 @@
-"""rope_ref (pure JAX, the recommended path) and the bridged vLLM rope kernel:
-fwd correctness against an independent reference, partial rotation, dtypes,
-position offsets, grads through rope_ref, jit. The bridge needs the full
-container; rope_ref tests run anywhere with a GPU."""
+"""Pure-JAX RoPE against NumPy, including partial rotation and gradients."""
 import numpy as np
 import pytest
 
@@ -101,21 +98,3 @@ def test_rope_ref_grad():
     inner = float(jnp.vdot(gq, vq) + jnp.vdot(gk, vk))
     np.testing.assert_allclose(inner, float(jv), rtol=1e-4)
     assert gk.shape == k.shape and bool(jnp.all(jnp.isfinite(gk)))
-
-
-@pytest.mark.torch
-@pytest.mark.parametrize("dt", [jnp.bfloat16, jnp.float16], ids=["bf16", "fp16"])
-def test_bridged_kernel_vs_ref(dt):
-    if not R.is_available():
-        pytest.skip("vllm rotary_embedding not importable")
-    head_size, H, T, max_pos = 128, 8, 64, 4096
-    g = np.random.default_rng(0)
-    q = jnp.asarray(g.standard_normal((T, H * head_size)) * 0.5, dt)
-    k = jnp.asarray(g.standard_normal((T, H * head_size)) * 0.5, dt)
-    pos = jnp.asarray(g.integers(0, max_pos, T).astype(np.int32))
-    csc = cos_sin_cache(max_pos, head_size).astype(dt)
-    qk, kk = R.rope(pos, q, k, head_size, csc)
-    qr, kr = R.rope_ref(pos, q, k, head_size, csc)
-    tol = 2e-2 if dt == jnp.bfloat16 else 5e-3
-    assert float(jnp.max(jnp.abs(qk.astype(jnp.float32) - qr.astype(jnp.float32)))) < tol
-    assert float(jnp.max(jnp.abs(kk.astype(jnp.float32) - kr.astype(jnp.float32)))) < tol

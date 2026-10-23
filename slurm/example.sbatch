@@ -18,12 +18,14 @@ REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 # /opt/venv -- so resolve it rather than pinning a name here.
 source "$REPO_DIR/tools/resolve_image.sh"
 SIF="$(jax_resolve_image lean)"
+VENV_DIR="$(readlink -f "$(_jax_venv_dir lean)")"
 
 module purge
 module use /appl/local/laifs/modules
 module load lumi-aif-singularity-bindings
 
-srun /usr/bin/singularity exec "$SIF" bash -c "
+srun /usr/bin/singularity exec -B "$VENV_DIR:$VENV_DIR" \
+    --env VENV_DIR="$VENV_DIR" "$SIF" bash -c "
     source $REPO_DIR/activate.sh
     # Replace with your own script. Add `source $REPO_DIR/tools/ray_visible_devices.sh`
     # before it if you import ray: without it `import ray` raises on a GPU node.

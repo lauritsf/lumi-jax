@@ -2,7 +2,7 @@
 # compat_matrix.sh <SIF> [baseline.txt] -- "does our code still build and pass against this
 # image?" (probe_image.sh answers "did the ABI surface move?"). Three stages, cheapest first:
 #   probe   diff the ABI surface against a committed baseline        (no GPU, seconds)
-#   build   rebuild all five csrc/ targets inside the image          (no GPU, minutes)
+#   build   rebuild CK attention inside the image          (no GPU, minutes)
 #   tests   run the pytest suite inside the image                    (needs GPUs, so srun it)
 # A stage that cannot run reports `unknown`, never a pass; a target whose *inputs* the image
 # does not ship reports `n/a`, not FAIL. Only FAIL is a problem.
@@ -14,7 +14,7 @@ if [ $# -lt 1 ]; then
     exit 2
 fi
 
-MATRIX_VERSION=1
+MATRIX_VERSION=2
 SIF="$1"
 BASELINE="${2:-}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,6 +29,7 @@ sec() { printf '\n[%s]\n' "$1"; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/compat-matrix.XXXXXX")"
 FAILED=0
+INCOMPLETE=0
 cleanup() {
     if [ "$FAILED" -eq 0 ]; then rm -rf "$WORK"
     else echo; echo "logs kept: $WORK" >&2; fi
@@ -73,14 +74,16 @@ if [ -x "$REPO_DIR/tools/probe_image.sh" ]; then
     else
         kv probe.baseline "UNRESOLVED"
         kv probe.verdict unknown
+    INCOMPLETE=1
     fi
 else
     kv probe.verdict unknown
+    INCOMPLETE=1
 fi
 
-# --- stage 2: build all five csrc targets ---
+# --- stage 2: build CK attention ---
 # prereq n/a means "not this image's job"; prereq ok + build FAIL means the image moved.
-TARGETS="sscan conv1d flash aotriton vllm"
+TARGETS=flash
 
 sec build
 printf '%-10s %-8s %-8s %s\n' target prereq build symbol
@@ -99,65 +102,17 @@ cp -r "$REPO_DIR/csrc" "$OUTDIR/repo/" || exit 1
 BUILD_ROOT="$OUTDIR/repo"
 LIBDIR="$BUILD_ROOT/lumi_kernels/lib"
 
-# By import, not a site-packages glob: there are two venvs. torch must be imported FIRST --
-# the *_cuda extensions are libtorch clients and otherwise fail with undefined symbols.
-pyhas() { python3 -c "import torch, $1" >/dev/null 2>&1 && echo ok || echo na; }
-
-# Three states: absent is fine (na), present-but-unreadable is broken (FAIL) -- images ship
-# /opt/fa-src 0770 root:root, which `-d` reports as fine.
-srcdir() {
-    if [ ! -d "$1" ]; then echo na
-    elif ls "$1" >/dev/null 2>&1; then echo ok
-    else echo FAIL; fi
-}
-both() {   # both <srcdir-state> <py-state> -- FAIL dominates, then na
-    case "$1$2" in *FAIL*) echo FAIL ;; *na*) echo na ;; *) echo ok ;; esac
-}
-
 prereq() {
-    case "$1" in
-      sscan)    srcdir "$FA_SRC_ROOT/mamba/csrc/selective_scan" ;;
-      conv1d)   both "$(srcdir "$FA_SRC_ROOT/causal-conv1d/csrc")" "$(pyhas causal_conv1d_cuda)" ;;
-      flash)    both "$(srcdir "$FA_SRC_ROOT/flash-attention")"   "$(pyhas flash_attn_2_cuda)" ;;
-      # Either source will do; requiring torch would report na for the torch-free image.
-      aotriton) { ls "${AOTRITON_ROOT:-/opt/aotriton}"/lib/libaotriton_v2.so* >/dev/null 2>&1 \
-                  || python3 -c 'import torch' >/dev/null 2>&1; } && echo ok || echo na ;;
-      vllm)     python3 -c 'import vllm._C' >/dev/null 2>&1 && echo ok || echo na ;;
-    esac
+    python3 -c 'import jaxlib' >/dev/null 2>&1 || { echo na; return; }
+    test -f "${CK_FMHA_ROOT:-/opt/ck-fmha}/lib/libck_fmha.so" || { echo na; return; }
+    test -r "${CK_FMHA_ROOT:-/opt/ck-fmha}/include/fmha_fwd.hpp" && echo ok || echo FAIL
 }
-
-script_for() {
-    case "$1" in
-      sscan)    echo csrc/sscan/build_sscan.sh ;;
-      conv1d)   echo csrc/conv1d/build_conv1d.sh ;;
-      flash)    echo csrc/flash/build_ffi.sh ;;
-      aotriton) echo csrc/aotriton/build_aotriton.sh ;;
-      vllm)     echo csrc/vllm/build_vllm_ffi.sh ;;
-    esac
-}
-
-so_for() {
-    case "$1" in
-      sscan)    echo liblumi_sscan.so ;;
-      conv1d)   echo liblumi_conv1d.so ;;
-      flash)    echo liblumi_fa_ffi.so ;;
-      aotriton) echo liblumi_aotriton.so ;;
-      vllm)     echo liblumi_vllm_ffi.so ;;
-    esac
-}
-
-sym_for() {
-    case "$1" in
-      sscan)    echo LumiSscan ;;
-      conv1d)   echo LumiConv1d ;;
-      flash)    echo LumiFaFwd ;;
-      aotriton) echo LumiAotFwd ;;
-      vllm)     echo LumiSiluAndMul ;;
-    esac
-}
+script_for() { echo csrc/flash/build_ffi.sh; }
+so_for() { echo liblumi_fa_ffi.so; }
+sym_for() { echo LumiFaFwd; }
 
 cd "$BUILD_ROOT" || exit 1
-for t in sscan conv1d flash aotriton vllm; do
+for t in flash; do
     p="$(prereq "$t")"
     if [ "$p" != ok ]; then
         echo "RESULT $t $p na na"
@@ -181,6 +136,7 @@ BUILD
 BUILD_RC=$?
 if [ $BUILD_RC -ne 0 ] && ! grep -q '^RESULT ' "$WORK/build.out" 2>/dev/null; then
     for t in $TARGETS; do printf '%-10s %-8s %-8s %s\n' "$t" unknown unknown unknown; done
+    INCOMPLETE=1
     kv build.verdict "unknown (could not run: $(tail -1 "$WORK/build.err" 2>/dev/null))"
     FAILED=1
 else
@@ -193,30 +149,35 @@ else
             set -- $line
             printf '%-10s %-8s %-8s %s\n' "$2" "$3" "$4" "$5"
             # prereq FAIL counts: the image ships the input unusable.
-            case "$3$4$5" in *FAIL*) nfail=$((nfail+1));; esac
+            case "$3$4$5" in *FAIL*) nfail=$((nfail+1));; *na*) INCOMPLETE=1;; esac
         fi
     done
     grep -E '^(DETAIL|LOGTAIL|    )' "$WORK/build.out" 2>/dev/null | sed 's/^/  /'
+    reason=$(sed -n 's/^REASON //p' "$WORK/build.out" | head -1)
+    [ -n "$reason" ] && kv build.reason "$reason"
     kv build.failures "$nfail"
     [ "$nfail" -gt 0 ] && FAILED=1
 fi
 
 # --- stage 3: the suite ---
-# Skips are not failures -- they are how the suite reports "this image lacks torch".
+# Missing GPU allocations cannot establish a pass.
 sec tests
 # Probe from the repo dir, repo bound, as the suite runs: it picks lumi_kernels up from cwd.
 if ! singularity exec -B "$REPO_BIND" "$SIF" \
         bash -c "cd '$REPO_REAL' && python3 -c 'import jax, lumi_kernels'" >/dev/null 2>&1; then
     # A stock LAIF base has no JAX; FAIL here would flag every base image as broken.
+    INCOMPLETE=1
     kv tests.verdict n/a
     kv tests.reason "image cannot import jax+lumi_kernels (expected for a stock base)"
 elif [ -z "${SLURM_JOB_ID:-}" ] || [ -z "${SLURM_GPUS_ON_NODE:-}${SLURM_JOB_GPUS:-}" ]; then
+    INCOMPLETE=1
     kv tests.verdict unknown
     kv tests.reason "no GPU allocation -- rerun under srun to exercise this stage"
 else
     if singularity exec -B "$REPO_BIND" "$SIF" \
-            bash -c "cd '$REPO_REAL' && python3 -m pytest tests -q" \
+            bash -c "cd '$REPO_REAL' && python3 -m pytest tests --ignore=tests/host -q" \
             > "$WORK/tests.out" 2>&1; then tv=ok; else tv=FAIL; FAILED=1; fi
+    if ! grep -qE '[1-9][0-9]* passed' "$WORK/tests.out"; then tv=FAIL; FAILED=1; fi
     summary=$(grep -E '^[0-9]+ (passed|failed)|passed|failed' "$WORK/tests.out" | tail -1)
     kv tests.summary "${summary:-unparsed}"
     kv tests.verdict "$tv"
@@ -224,5 +185,7 @@ else
 fi
 
 sec verdict
-kv matrix.verdict "$([ "$FAILED" -eq 0 ] && echo pass || echo ATTENTION)"
-exit 0
+if [ "$FAILED" -ne 0 ]; then kv matrix.verdict FAIL
+elif [ "$INCOMPLETE" -ne 0 ]; then kv matrix.verdict unknown
+else kv matrix.verdict pass; fi
+exit "$FAILED"

@@ -32,15 +32,7 @@ def _ensure_registered():
     global _registered, _DUMMY_ALIBI
     if _registered:
         return
-    # torch is a fallback, not a requirement: a torch-built .so links libtorch/libc10,
-    # which resolve only after torch and flash_attn load; a torch-free build is
-    # self-contained and dlopens bare.
-    try:
-        lib = ctypes.CDLL(_so_path(_SO_NAME))
-    except OSError:
-        import torch  # noqa: F401  (pulls libtorch/libc10 in before we dlopen ours)
-        import flash_attn  # noqa: F401
-        lib = ctypes.CDLL(_so_path(_SO_NAME))
+    lib = ctypes.CDLL(_so_path(_SO_NAME))
     for target, symbol in (("lumi_fa_fwd", "LumiFaFwd"), ("lumi_fa_bwd", "LumiFaBwd"),
                            ("lumi_fa_varlen_fwd", "LumiFaVarlenFwd"),
                            ("lumi_fa_varlen_bwd", "LumiFaVarlenBwd"),
@@ -358,107 +350,7 @@ def flash_attn_kvcache_step(q, k_cache, v_cache, cache_seqlens, *, knew=None, vn
 
 
 # AOTriton forward: ~20% faster than CK forward, ~25% slower on backward -- CK for training,
-# AOTriton for forward-only. Separate liblumi_aotriton.so linking libaotriton_v2.so.
-_AOT_SO_NAME = "liblumi_aotriton.so"
-_aot_registered = False
 
-
-def _ensure_aot_registered():
-    global _aot_registered
-    if _aot_registered:
-        return
-    # torch is a fallback, not a requirement: against torch's bundled libaotriton_v2.so the
-    # .so resolves only after torch loads; against a standalone one it has its own RPATH.
-    try:
-        lib = ctypes.CDLL(_so_path(_AOT_SO_NAME))
-    except OSError:
-        import torch  # noqa: F401
-        lib = ctypes.CDLL(_so_path(_AOT_SO_NAME))
-    addr = ctypes.cast(lib.LumiAotFwd, ctypes.c_void_p).value
-    jax.ffi.register_ffi_target("lumi_aot_fwd", jax.ffi.pycapsule(addr), platform="ROCM")
-    _aot_registered = True
-
-
-def aotriton_available():
-    try:
-        _ensure_aot_registered()
-        return _have(_AOT_SO_NAME)
-    except Exception:
-        return False
-
-
-def flash_attention_aotriton(q, k, v, *, causal=False, scale=None, window=(-1, -1)):
-    """Forward-only fused attention via AOTriton (jittable). (B,S,H,D) bf16/fp16.
-    Faster than CK on the forward; for training use flash_attention_ffi (CK)."""
-    _ensure_aot_registered()
-    B, S, H, D = q.shape
-    if scale is None:
-        scale = 1.0 / (D ** 0.5)
-    wl, wr = window  # handler encodes causal itself (WindowedAttention magic value)
-    if (wl, wr) != (-1, -1):
-        # AOTriton's local-window alignment differs from CK and is not wired here.
-        raise NotImplementedError(
-            "AOTriton local window not wired; use flash_attention_ffi (CK) for windows")
-    out_t = jax.ShapeDtypeStruct(q.shape, q.dtype)
-    lse_t = jax.ShapeDtypeStruct((B * H, S), jnp.float32)
-    out, _ = jax.ffi.ffi_call("lumi_aot_fwd", (out_t, lse_t))(
-        q, k, v,
-        scale=np.float64(scale),
-        is_bf16=np.int32(1 if q.dtype == jnp.bfloat16 else 0),
-        is_causal=np.int32(1 if causal else 0),
-        window_left=np.int32(wl),
-        window_right=np.int32(wr),
-    )
-    return out
-
-
-# HYBRID: AOTriton forward + CK backward, which beats any single-backend path. Works only
-# because AOTriton's softmax_lse is bit-identical to CK's, so CK's backward consumes it.
-def _aot_fwd_lse(q, k, v, scale, causal):
-    B, S, H, D = q.shape
-    out_t = jax.ShapeDtypeStruct(q.shape, q.dtype)
-    lse_t = jax.ShapeDtypeStruct((B * H, S), jnp.float32)
-    out, lse = jax.ffi.ffi_call("lumi_aot_fwd", (out_t, lse_t))(
-        q, k, v,
-        scale=np.float64(scale),
-        is_bf16=np.int32(1 if q.dtype == jnp.bfloat16 else 0),
-        is_causal=np.int32(1 if causal else 0),
-        window_left=np.int32(-1), window_right=np.int32(-1))
-    return out, lse.reshape(B, H, S)
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
-def _flash_hybrid(q, k, v, causal, scale):
-    _ensure_registered(); _ensure_aot_registered()
-    if scale is None:
-        scale = 1.0 / (q.shape[-1] ** 0.5)
-    out, _ = _aot_fwd_lse(q, k, v, scale, causal)
-    return out
-
-
-def _hyb_fwd(q, k, v, causal, scale):
-    _ensure_registered(); _ensure_aot_registered()
-    if scale is None:
-        scale = 1.0 / (q.shape[-1] ** 0.5)
-    out, lse = _aot_fwd_lse(q, k, v, scale, causal)  # AOTriton forward
-    return out, (q, k, v, out, lse)
-
-
-def _hyb_bwd(causal, scale, res, dout):
-    q, k, v, out, lse = res
-    if scale is None:
-        scale = 1.0 / (q.shape[-1] ** 0.5)
-    return _bwd_call(dout, q, k, v, out, lse, _DUMMY_ALIBI, _rng_buf(0),  # CK backward
-                     scale, causal, (-1, -1), False, 0.0, False)
-
-
-_flash_hybrid.defvjp(_hyb_fwd, _hyb_bwd)
-
-
-def flash_attention_hybrid(q, k, v, *, causal=False, scale=None):
-    """Fastest-per-direction flash attention: AOTriton forward + CK backward (jittable).
-    Beats any single-backend path. Causal/non-causal, MHA/GQA/MQA, fp16/bf16, D<=256."""
-    return _flash_hybrid(q, k, v, causal, scale)
 
 
 def flash_attention_varlen_ffi(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,

@@ -1,18 +1,13 @@
 #!/bin/bash
-# build_ck_fmha.sh [outdir] -- build the ck_tile FMHA kernels as a standalone, torch-free
-# shared library, replacing the flash_attn_2_cuda PyTorch extension csrc/flash otherwise
-# links only because that is where the compiled CK instances live.
-# THE FLAGS ARE COPIED FROM flash-attention's setup.py, NOT CK's example CMakeLists: the
-# example's flags compile cleanly and produce different, slower kernels with no symbol-level
-# evidence. Keep in sync with setup.py.
-
+# Keep compiler flags matched to flash-attention setup.py; ABI checks cannot detect
+# incompatible template instantiation flags.
 set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/image_name.sh"
 
-OUT="${1:-${LUMI_JAX_WORK:?set it, or create tools/site.local.sh}/ck-fmha}"
-SIF="${SIF:-${LUMI_JAX_WORK:?set it, or create tools/site.local.sh}/images/lumi-jax-stage-aotriton-j091-latest.sif}"
-FA_SRC_ROOT="${FA_SRC_ROOT:?set it to the upstream sources checkout (flash-attention, mamba, causal-conv1d); the container builds export /opt/fa-src}"
+OUT="${1:-${BUILD_ARTIFACT_DIR:?set LUMI_JAX_WORK}/ck-fmha}"
+SIF="${SIF:-${IMAGES_DIR:?set LUMI_JAX_WORK}/lumi-jax-stage-net-j091-latest.sif}"
+FA_SRC_ROOT="${FA_SRC_ROOT:?set it to the upstream sources checkout containing flash-attention}"
 JOBS="${JOBS:-$(nproc)}"
 TARGETS="${TARGETS:-gfx90a}"
 # flash-attention's default; narrowing it makes dropped dims raise "no CK kernel instance".

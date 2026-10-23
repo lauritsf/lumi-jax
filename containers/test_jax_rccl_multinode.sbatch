@@ -5,8 +5,6 @@
 #   sbatch containers/test_jax_rccl_multinode.sbatch [/path/to/image.sif]
 # Set SBATCH_ACCOUNT before submitting.
 #SBATCH --job-name=jax-rccl-multinode
-# standard-g: dev-g allocates no 2 x 8 GCD shape, caps submitted jobs per user, and hands
-# out GCDs differently -- hence the pinning branch below.
 #SBATCH --partition=standard-g
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=8
@@ -19,11 +17,16 @@ set -euo pipefail
 
 REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 source "$REPO_DIR/tools/image_name.sh"
-SIF="${1:-${LUMI_JAX_WORK:?set it, or create tools/site.local.sh}/images/lumi-jax-stage-net-j091-latest.sif}"
+SIF="${1:-${SIF:-${IMAGES_DIR:?set LUMI_JAX_WORK}/lumi-jax-lean-j0112-latest.sif}}"
+SIF="$(readlink -f "$SIF")"
+test -f "$SIF" || { echo "FATAL: image missing: $SIF"; exit 1; }
+echo "image $SIF"
 
 module purge
 module use /appl/local/laifs/modules
 module load lumi-aif-singularity-bindings
+
+unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE VSCODE_PROXY_URI
 
 # Deliberately no FI_* or NCCL_* tuning: this measures the image as shipped.
 export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)"
@@ -34,7 +37,7 @@ export MASTER_PORT="1${SLURM_JOB_ID: -4}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
 # Shared scratch, not /tmp: the batch script runs on the first node only, /tmp is node-local.
-WORKDIR="${LUMI_JAX_WORK:?set it, or create tools/site.local.sh}/images"
+WORKDIR="${IMAGES_DIR:?set LUMI_JAX_WORK}"
 PYFILE="$WORKDIR/rccl_mn_$SLURM_JOB_ID.py"
 cat > "$PYFILE" <<'EOF'
 import os
@@ -105,4 +108,7 @@ if grep -aq "Assigned NET plugin Socket" "$NCCLLOG"; then
     exit 1
 fi
 grep -aq "NET/OFI" "$NCCLLOG" || { echo "FATAL: no NET/OFI in the log"; exit 1; }
-echo "transport OK: NET/OFI"
+grep -aq "NET/OFI Selected provider is cxi" "$NCCLLOG" || {
+    echo "FATAL: NET/OFI did not select CXI"; exit 1;
+}
+echo "transport OK: NET/OFI with CXI"

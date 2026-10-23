@@ -1,14 +1,7 @@
 #!/bin/bash
-# Acceptance for the jax 0.11.0 image, covering two claims the suite cannot check: that all
-# four of jax/jaxlib/plugin/pjrt are really 0.11.0 (a half-pinned pair still imports and
-# runs), and that the hipBLASLt stub is NEVER CALLED, which is what the image rests on since
-# the stub makes a workspace cap silently not apply. Hence a real workload, grepped at the
-# end for the stub's warning.
-#
-#   sbatch containers/test_jax011.sbatch [/path/to/image.sif]
+# Acceptance for selected JAX 0.11 pins, native ROCm APIs, GEMM, and collectives.
 # Set SBATCH_ACCOUNT before submitting.
 #SBATCH --job-name=jax011-test
-# standard-g: dev-g allocates no 8-GCD full-node shape, and caps submitted jobs per user.
 #SBATCH --partition=standard-g
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -24,32 +17,35 @@
 set -euo pipefail
 
 REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
-source "$REPO_DIR/tools/image_name.sh"
+source "$REPO_DIR/tools/resolve_image.sh"
 WORK="${LUMI_JAX_WORK:?set it, or create tools/site.local.sh}"
-SIF="${1:-$WORK/images/lumi-jax-stage-net-j0110-latest.sif}"
+JAXVER="$(jax_line lean)"
+case "$JAXVER" in 0.11.0|0.11.2) ;; *) echo "FATAL: select a JAX 0.11 line"; exit 2 ;; esac
+SIF="${1:-$(jax_resolve_image lean "$JAXVER")}"
+SIF="$(readlink -f "$SIF")"
 
-test -f "$SIF" || { echo "FATAL: image missing: $SIF"; \
-    echo "       sbatch --export=ALL,VARIANT=stage-net,JAXVER=0.11.0 containers/build_jax_version.sbatch"; exit 1; }
+test -f "$SIF" || { echo "FATAL: image missing: $SIF"; exit 1; }
 
 module purge
 module use /appl/local/laifs/modules
 module load lumi-aif-singularity-bindings
 
+unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE
+
 # A separate file: the job's own --output cannot be grepped from inside that job.
-LOG="$WORK/images/test011-${SLURM_JOB_ID:-local}-workload.log"
+LOG="$IMAGES_DIR/test011-${SLURM_JOB_ID:-local}-workload.log"
 : > "$LOG"
 
 set +e
 # PYTHONUNBUFFERED: piping into tee makes python block-buffer, so the gate looks hung.
 srun --export=ALL,PYTHONUNBUFFERED=1 singularity exec --env PYTHONUNBUFFERED=1 "$SIF" bash -c "
     set -eux
-    # The stub is a real .so in libhipblaslt's NEEDED list precisely so this stays empty.
     test -z \"\${LD_PRELOAD:-}\" || { echo 'FATAL: LD_PRELOAD is set'; exit 1; }
     echo \"LD_LIBRARY_PATH=\${LD_LIBRARY_PATH:-}\"
 
     python3 - <<'PY'
 import importlib.metadata as md
-want = '0.11.0'
+want = '$JAXVER'
 for p in ('jax', 'jaxlib', 'jax-rocm7-plugin', 'jax-rocm7-pjrt'):
     got = md.version(p)
     print(f'{p:<20} {got}')
@@ -57,15 +53,7 @@ for p in ('jax', 'jaxlib', 'jax-rocm7-plugin', 'jax-rocm7-pjrt'):
 print('QUADRUPLE OK')
 PY
 
-    # Re-checked on the built image: %post can gate and a later layer still shadow the stub.
-    HB=\$(readlink -f /opt/rocm/lib/libhipblaslt.so.1)
-    readelf -d \"\$HB\" | grep -E 'NEEDED.*lumi_hipblaslt_stub' \
-        || { echo 'FATAL: stub not in libhipblaslt NEEDED'; exit 1; }
-    PLUGIN=/opt/venv/lib/python3.12/site-packages/jax_plugins/xla_rocm7/xla_rocm_plugin.so
-    if ldd -r \"\$PLUGIN\" 2>&1 | grep 'setMaxWorkspaceBytes'; then
-        echo 'FATAL: setMaxWorkspaceBytes still unresolved for the plugin'; exit 1
-    fi
-    echo 'STUB WIRED OK'
+    bash /opt/lumi-jax-tools/verify_native_rocm.sh
 
     python3 - <<'PY'
 import numpy as np
@@ -109,23 +97,14 @@ for dt in (jnp.float32, jnp.bfloat16, jnp.float16):
 print('GEMM EPILOGUE SWEEP OK')
 PY
 
-    cd $REPO_DIR && python3 -m pytest tests -q
+    cd $REPO_DIR && python3 -m pytest tests -q -m 'not so'
 " 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 
 echo
-echo "===== stub tripwire"
-if grep -q '\[lumi-jax\] WARNING' "$LOG"; then
-    echo "FINDING: the hipBLASLt stub WAS called. The 'unreachable' assumption behind this"
-    echo "image is wrong, the workspace cap was silently not applied, and the fix is a ROCm"
-    echo "7.1+ base rather than a stub."
-    grep '\[lumi-jax\] WARNING' "$LOG"
-    rc=1
-else
-    echo "the stub was not called during any of the above (devices, pmap, GEMM sweep, suite)"
+[ "$rc" = 0 ] || exit "$rc"
+if ! grep -qE '[1-9][0-9]* passed' "$LOG"; then
+    echo "FATAL: no pytest test executed"; exit 1
 fi
-
-echo
-echo "workload log: $LOG"
-exit "$rc"
+echo "JAX 0.11 NATIVE ROCM OK"

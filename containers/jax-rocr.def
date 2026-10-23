@@ -1,0 +1,21 @@
+Bootstrap: localimage
+From: {{BASE}}
+
+%files
+    {{PAYLOAD}}/libhsa-runtime64.so.1.18.0 /opt/rocm-7.2.4/lib/libhsa-runtime64.so.1.18.70204
+    {{PAYLOAD}}/manifest.json /opt/lumi-jax-rocr/manifest.json
+    containers/patches/rocr-4066.patch /opt/lumi-jax-rocr/rocr-4066.patch
+    containers/patches/rocr-7874.patch /opt/lumi-jax-rocr/rocr-7874.patch
+
+%post
+    set -eu
+    chmod -R a+rX /opt/lumi-jax-rocr
+    ldd /opt/rocm/lib/libhsa-runtime64.so.1 > /tmp/rocr-ldd
+    cat /tmp/rocr-ldd
+    ! grep -q 'not found' /tmp/rocr-ldd
+    rm /tmp/rocr-ldd
+
+%labels
+    rocr.base rocm-7.2.4
+    rocr.staging-fix 559d48b1f013a2a8e9decd2557508de7ac6c6b10
+    rocr.retry-fix 2d49e664f3a8a6ba0d2e025c0dde3b9b4f9dc6c6

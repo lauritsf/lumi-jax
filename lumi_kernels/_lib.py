@@ -10,7 +10,7 @@ import os
 
 LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
 
-# Where both image recipes install. Absent on a bare host, hence the skip-missing search.
+# Image fallback is absent on a bare host.
 IMAGE_LIB_DIR = "/opt/lumi-jax/lumi_kernels/lib"
 
 
@@ -55,7 +55,6 @@ def so_path(name: str) -> str:
         tried.append(path)
     raise FileNotFoundError(
         f"{name} not found -- run the matching csrc/*/build_*.sh, "
-        f"or use an image that ships it (lumi-jax-lean-j*-latest.sif has four of the "
-        f"five, lumi-jax-torch-j091-latest.sif has all five). Looked in: "
+        f"or use a lean image with CK attention. Looked in: "
         + ", ".join(tried)
     )

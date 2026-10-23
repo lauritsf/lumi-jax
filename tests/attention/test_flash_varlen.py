@@ -1,7 +1,4 @@
-"""Validate the varlen / packed XLA-FFI binding vs flash_attn_varlen_func across
-MHA / GQA, causal + non-causal, and a local window -- forward and gradients.
-Needs the `torch` image.
-"""
+"""CK forward and gradients against an independent float32 JAX reference."""
 import numpy as np
 import pytest
 
@@ -9,16 +6,14 @@ import jax
 import jax.numpy as jnp
 
 from lumi_kernels.attention import flash_ffi as F
+from oracle import attention
 
-pytestmark = [pytest.mark.gpu, pytest.mark.torch, pytest.mark.so("liblumi_fa_ffi.so")]
+pytestmark = [pytest.mark.gpu, pytest.mark.so("liblumi_fa_ffi.so")]
 
 
-def _vs_torch(seqlens, Hq, Hk, D, causal, window, dtype, max_pad=0):
-    import torch
-    from flash_attn import flash_attn_varlen_func
+def _vs_reference(seqlens, Hq, Hk, D, causal, window, dtype, max_pad=0):
 
     jdt = {"bf16": jnp.bfloat16, "fp16": jnp.float16}[dtype]
-    tdt = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
     total = int(sum(seqlens))
     cu = np.concatenate([[0], np.cumsum(seqlens)]).astype(np.int32)
     max_s = int(max(seqlens)) + max_pad
@@ -37,17 +32,17 @@ def _vs_torch(seqlens, Hq, Hk, D, causal, window, dtype, max_pad=0):
     _, vjp = jax.vjp(lambda q, k, v: jax.jit(fn)(q, k, v), qj, kj, vj)
     dqj, dkj, dvj = vjp(jnp.asarray(gn).astype(jdt))
 
-    qt, kt, vt = (torch.tensor(x, device="cuda", dtype=tdt, requires_grad=True) for x in (qn, kn, vn))
-    cut = torch.tensor(cu, device="cuda")
-    ot = flash_attn_varlen_func(qt, kt, vt, cut, cut, max_s, max_s,
-                                softmax_scale=scale, causal=causal, window_size=window)
-    dqt, dkt, dvt = torch.autograd.grad(ot, (qt, kt, vt), torch.tensor(gn, device="cuda", dtype=tdt))
+    def ref(q, k, v):
+        return jnp.concatenate([attention(q[a:b][None], k[a:b][None], v[a:b][None],
+            causal=causal, scale=scale, window=window)[0] for a, b in zip(cu[:-1], cu[1:])])
+    ot, pullback = jax.vjp(ref, *(x.astype(jnp.float32) for x in (qj, kj, vj)))
+    dqt, dkt, dvt = pullback(jnp.asarray(gn).astype(jdt).astype(jnp.float32))
 
     tol = 3e-2 if dtype == "bf16" else 1.5e-2
 
     def err(aj, bt):
         return float(np.max(np.abs(np.asarray(aj, np.float32) -
-                                   bt.detach().to(torch.float32).cpu().numpy())))
+                                   np.asarray(bt, np.float32))))
 
     assert err(out_j, ot) < tol, "fwd"
     assert err(dqj, dqt) < tol * 2, "dq"
@@ -69,4 +64,4 @@ CASES = {
 @pytest.mark.parametrize("name", list(CASES))
 def test_vs_flash_attn_varlen(name, dtype):
     seqlens, Hq, Hk, D, causal, window = CASES[name]
-    _vs_torch(seqlens, Hq, Hk, D, causal, window, dtype)
+    _vs_reference(seqlens, Hq, Hk, D, causal, window, dtype)

@@ -1,0 +1,24 @@
+# Update Python adapters while retaining the parent's compiled kernels and runtime.
+Bootstrap: localimage
+From: {{ BASE }}
+
+%files
+    lumi_kernels /opt/lumi-jax-python-src/lumi_kernels
+
+%post
+    set -eux
+    sha256sum /opt/lumi-jax/lumi_kernels/lib/*.so > /tmp/kernels-before.sha256
+    rm -rf /opt/lumi-jax-python-src/lumi_kernels/lib
+    find /opt/lumi-jax-python-src /opt/lumi-jax/lumi_kernels \
+        -type d -name __pycache__ -prune -exec rm -rf {} +
+    find /opt/lumi-jax/lumi_kernels -type f -name "*.py" -delete
+    cp -a /opt/lumi-jax-python-src/lumi_kernels/. /opt/lumi-jax/lumi_kernels/
+    rm -rf /opt/lumi-jax-python-src
+    chmod -R a+rX /opt/lumi-jax/lumi_kernels
+    sha256sum /opt/lumi-jax/lumi_kernels/lib/*.so > /tmp/kernels-after.sha256
+    cmp /tmp/kernels-before.sha256 /tmp/kernels-after.sha256
+    rm /tmp/kernels-before.sha256 /tmp/kernels-after.sha256
+
+%labels
+    BaseImage {{ BASE }}
+    PythonOverlay lumi_kernels

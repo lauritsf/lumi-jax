@@ -1,6 +1,4 @@
-"""flash_attn_kvcache_ffi (CK split-KV decode, RAW torch-free FFI, jittable) vs a
-pure-JAX full-attention reference over the valid cache, and vs torch's
-flash_attn_with_kvcache (the same kernel). Needs the `torch` image."""
+"""CK cache decode and append against a pure-JAX reference."""
 import numpy as np
 import pytest
 
@@ -9,7 +7,7 @@ import jax.numpy as jnp
 
 from lumi_kernels.attention import flash_ffi as F
 
-pytestmark = [pytest.mark.gpu, pytest.mark.torch, pytest.mark.so("liblumi_fa_ffi.so")]
+pytestmark = [pytest.mark.gpu, pytest.mark.so("liblumi_fa_ffi.so")]
 
 
 def ref(q, kc, vc, seqlens, scale):
@@ -91,19 +89,10 @@ def test_decode(name):
     tol = 6e-2 if dt == jnp.bfloat16 else 2e-2
     assert e < tol, f"vs JAX ref: {e:.4f}"
 
-    import torch
-    from flash_attn import flash_attn_with_kvcache
-    tdt = torch.bfloat16 if dt == jnp.bfloat16 else torch.float16
-    tq, tkc, tvc = (torch.tensor(np.asarray(x, np.float32), device="cuda", dtype=tdt)
-                    for x in (q, kc, vc))
-    tsl = torch.tensor(np.asarray(sl), device="cuda")
-    to = flash_attn_with_kvcache(tq, tkc, tvc, cache_seqlens=tsl, softmax_scale=scale, causal=False)
-    et = float(np.max(np.abs(np.asarray(o, np.float32) - to.float().cpu().numpy())))
-    assert et < tol, f"vs torch kvcache: {et:.4f}"
 
 
 def _step_case(B, Sq, Hq, Hk, D, Sk, Snew, dt, *, rotary=False, interleaved=False,
-               causal=False, paged=False, torch_check=False, seqlens=None):
+               causal=False, paged=False, seqlens=None):
     rng = np.random.default_rng(1)
     q = jnp.asarray(rng.standard_normal((B, Sq, Hq, D)) * .5, dt)
     kc = jnp.asarray(rng.standard_normal((B, Sk, Hk, D)) * .5, dt)
@@ -153,30 +142,16 @@ def _step_case(B, Sq, Hq, Hk, D, Sk, Snew, dt, *, rotary=False, interleaved=Fals
             ek = max(ek, float(jnp.max(jnp.abs(kcu[b, :L].astype(jnp.float32) - kc[b, :L].astype(jnp.float32)))))
             assert ek < tol, f"cache contents b={b} err {ek:.4f}"
 
-    if torch_check:
-        import torch
-        from flash_attn import flash_attn_with_kvcache
-        tdt = torch.bfloat16 if dt == jnp.bfloat16 else torch.float16
-        tt = lambda x: (torch.tensor(np.asarray(x, np.float32), device="cuda", dtype=tdt)
-                        if x.dtype == dt else torch.tensor(np.asarray(x), device="cuda"))
-        to = flash_attn_with_kvcache(
-            tt(q), tt(kc), tt(vc), k=tt(kn) if kn is not None else None,
-            v=tt(vn) if vn is not None else None, cache_seqlens=tt(sl),
-            rotary_cos=tt(rc) if rc is not None else None,
-            rotary_sin=tt(rs) if rs is not None else None,
-            rotary_interleaved=interleaved, softmax_scale=scale, causal=causal)
-        et = float(np.max(np.abs(np.asarray(out, np.float32) - to.float().cpu().numpy())))
-        assert et < tol, f"vs torch step: {et:.4f}"
 
 
 STEP = {
-    "append-Sq1-bf16": dict(B=4, Sq=1, Hq=8, Hk=8, D=128, Sk=2048, Snew=1, dt=jnp.bfloat16, torch_check=True),
+    "append-Sq1-bf16": dict(B=4, Sq=1, Hq=8, Hk=8, D=128, Sk=2048, Snew=1, dt=jnp.bfloat16),
     "append-chunk-Sq4-GQA-fp16": dict(B=2, Sq=4, Hq=16, Hk=4, D=128, Sk=1024, Snew=4, dt=jnp.float16,
-                                      causal=True, torch_check=True),
+                                      causal=True),
     "rope-half-bf16": dict(B=4, Sq=1, Hq=8, Hk=8, D=128, Sk=1024, Snew=1, dt=jnp.bfloat16,
-                           rotary=True, torch_check=True),
+                           rotary=True),
     "rope-interleaved-fp16": dict(B=2, Sq=1, Hq=16, Hk=4, D=128, Sk=1024, Snew=1, dt=jnp.float16,
-                                  rotary=True, interleaved=True, torch_check=True),
+                                  rotary=True, interleaved=True),
     "rope-D64-bf16": dict(B=2, Sq=1, Hq=8, Hk=8, D=64, Sk=512, Snew=1, dt=jnp.bfloat16, rotary=True),
     "no-append-bf16": dict(B=4, Sq=1, Hq=8, Hk=8, D=128, Sk=2048, Snew=0, dt=jnp.bfloat16),
     "paged-append-bf16": dict(B=2, Sq=1, Hq=8, Hk=8, D=128, Sk=1024, Snew=1, dt=jnp.bfloat16, paged=True),

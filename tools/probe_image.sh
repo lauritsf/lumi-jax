@@ -1,6 +1,6 @@
 #!/bin/bash
-# probe_image.sh <SIF> [...] -- dump the ABI surface lumi-jax depends on; a new base is
-# safe iff the diff against tools/baselines/ is clean. No host bindings, login-node safe.
+# probe_image.sh <SIF> [...] -- dump the ABI surface for comparison with tools/baselines/.
+# GPU behavior requires the compute-node acceptance gates.
 
 set -uo pipefail
 
@@ -10,7 +10,7 @@ if [ $# -lt 1 ]; then
 fi
 
 # Bump when a field's *meaning* changes, so a stale baseline diffs as a header line.
-PROBE_VERSION=2
+PROBE_VERSION=4
 
 # The in-container probe. Quoted heredoc: nothing here is expanded by the host.
 read -r -d '' PROBE_BODY <<'PROBE' || true
@@ -153,7 +153,7 @@ else
        "$([ "$(sym_count "$RCCL_SO" '^ncclCommWindow')" -eq 0 ] && echo yes || echo no)"
 fi
 
-# jax plugin 0.9.2+ needs setMaxWorkspaceBytes; absent here, hence the 0.9.1.post5 pin.
+# Newer JAX plugins require the native hipBLASLt workspace API.
 sec plugin-gate
 HIPBLASLT=$(lib_any libhipblaslt)
 kv_or hipblaslt.path "$HIPBLASLT"
@@ -209,19 +209,14 @@ kv_or ofi_plugin.rccl_name "$(plugin_path librccl-net.so)"
 kv_or ofi_plugin.nccl_name "$(plugin_path libnccl-net.so)"
 
 sec python-pins
-for dist in jax jaxlib jax-rocm7-plugin jax-rocm7-pjrt \
-            torch triton vllm flash_attn causal-conv1d \
-            transformer_engine transformer-engine-torch transformers; do
+for dist in jax jaxlib jax-rocm7-plugin jax-rocm7-pjrt; do
     kv_or "pin.$dist" "$(pip_ver "$dist")"
 done
 
 # Kernel binaries csrc/ links: a changed signature here is a broken csrc/ target.
 sec kernel-abi
 
-# Order csrc/flash/build_ffi.sh uses: standalone libck_fmha.so wins over the
-# flash_attn_2_cuda torch extension. site-packages alone goes blind on the torch-free image.
 FA_SO=$(first_match "${CK_FMHA_ROOT:-/opt/ck-fmha}/lib/libck_fmha.so")
-[ -n "$FA_SO" ] || FA_SO=$(first_match "$SP/flash_attn_2_cuda*.so")
 kv_or flash.path "$FA_SO"
 # The two dispatchers csrc/flash calls; bwd is a template, so it demangles with a return type.
 syms "$FA_SO" '^(float )?fmha_(fwd|bwd)(<[0-9]+>)?\(' | while read -r s; do kv flash.sym "$s"; done
@@ -229,35 +224,6 @@ syms "$FA_SO" '^(float )?fmha_(fwd|bwd)(<[0-9]+>)?\(' | while read -r s; do kv f
 kv    flash.fwd_kernel_instances "$(sym_count "$FA_SO" '^(float )?fmha_fwd_<')"
 kv    flash.bwd_kernel_instances "$(sym_count "$FA_SO" '^(float )?fmha_bwd_<')"
 
-# Same pattern: standalone install wins over torch's bundled copy.
-AOT_DIR="${AOTRITON_ROOT:-/opt/aotriton}/lib"
-[ -n "$(first_match "$AOT_DIR/libaotriton_v2.so")" ] || AOT_DIR="$SP/torch/lib"
-AOT_SO=$(first_match "$AOT_DIR/libaotriton_v2.so")
-kv_or aotriton.path    "$AOT_SO"
-kv_or aotriton.sonames "$(sonames_of "$AOT_DIR/libaotriton_v2.so*")"
-kv_or aotriton.soname  "$([ -n "$AOT_SO" ] && readelf -d "$AOT_SO" 2>/dev/null | awk -F'[][]' '/SONAME/{print $2}')"
-# We call v3::flash::attn_fwd; v2 presence recorded for context.
-kv    aotriton.attn_fwd_v2 "$(sym_count "$AOT_SO" 'aotriton::v2::flash::attn_fwd\(')"
-kv    aotriton.attn_fwd_v3 "$(sym_count "$AOT_SO" 'aotriton::v3::flash::attn_fwd\(')"
-syms "$AOT_SO" 'aotriton::v[23]::flash::attn_fwd\(' | while read -r s; do kv aotriton.sym "$s"; done
-
-CC_SO=$(first_match "$SP/causal_conv1d_cuda*.so")
-kv_or conv1d.path "$CC_SO"
-# Upstream instantiates 9: {fp32,fp16,bf16} x {fp32,fp16,bf16}.
-kv    conv1d.fwd_instantiations "$(sym_count "$CC_SO" 'causal_conv1d_fwd_cuda<')"
-kv    conv1d.bwd_instantiations "$(sym_count "$CC_SO" 'causal_conv1d_bwd_cuda<')"
-syms "$CC_SO" 'causal_conv1d_(fwd|bwd)_cuda<' | while read -r s; do kv conv1d.sym "$s"; done
-
-VLLM_SO=$(first_match "$SP/vllm/_C.abi3.so")
-kv_or vllm.path "$VLLM_SO"
-# Only the two torch-ABI ops we bind; the launcher templates are noise.
-syms "$VLLM_SO" '^(silu_and_mul|paged_attention_v1)\(' | while read -r s; do kv vllm.sym "$s"; done
-
-sec libtorch
-kv_or torch.lib_dir  "$([ -d "$SP/torch/lib" ] && echo "$SP/torch/lib")"
-kv_or torch.sonames  "$(sonames_of "$SP/torch/lib/libtorch*.so $SP/torch/lib/libc10*.so")"
-C10=$(first_match "$SP/torch/lib/libc10.so")
-kv    torch.cxx11_abi "$(has_sym "$C10" '__cxx11')"
 PROBE
 
 status=0

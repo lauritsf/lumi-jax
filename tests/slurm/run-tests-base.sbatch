@@ -7,11 +7,9 @@
 #SBATCH --cpus-per-task=56
 #SBATCH --gpus-per-node=8
 # Sized for a COLD autotune cache: test_memory's 32768^2 GEMM costs ~23 min on the 0.11.0
-# line and ~3 s once cached. It is marked gpu, not torch, so -m 'not torch' still runs it.
 #SBATCH --time=01:00:00
 #SBATCH --output=jax-tests-%j.out
 
-# Pytest suite in the lean image: pure-JAX plus the torch-free kernels. torch-marked
 # tests auto-skip via conftest; the -m filter avoids collecting them at all.
 # Submit from the repo root.
 set -euo pipefail
@@ -24,10 +22,12 @@ REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 source "$REPO_DIR/tools/resolve_image.sh"
 SIF="$(jax_resolve_image lean)"
 
-# Without this XLA re-autotunes every fusion on every run. Split by jax line: entries are
-# keyed per fusion for one XLA build, so a shared directory just misses and re-autotunes.
-AUTOTUNE_CACHE="${LUMI_JAX_AUTOTUNE_CACHE:-${LUMI_JAX_WORK:?set it, or create tools/site.local.sh}/xla-autotune}/j$(jax_line_tag "$(jax_line lean)")"
+# Keep runtime libraries and JAX builds separate by using the immutable image name.
+AUTOTUNE_CACHE="${LUMI_JAX_AUTOTUNE_CACHE:-${LUMI_JAX_WORK:?set it, or create tools/site.local.sh}/xla-autotune}/$(basename "$(readlink -f "$SIF")" .sif)"
 mkdir -p "$AUTOTUNE_CACHE"
+AUTOTUNE_CACHE="$(readlink -f "$AUTOTUNE_CACHE")"
+VENV_DIR="$(readlink -f "$(_jax_venv_dir lean)")"
+test -f "$VENV_DIR/bin/activate"
 
 module purge
 module use /appl/local/laifs/modules
@@ -36,15 +36,29 @@ module load lumi-aif-singularity-bindings
 # srun refuses inherited mem env from the submitting shell
 unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE
 
-LOG="${SLURM_SUBMIT_DIR:-.}/jax-tests-${SLURM_JOB_ID:-$$}.pytest.out"
+LOG_DIR="${LUMI_JAX_TEST_LOG_DIR:-$LUMI_JAX_WORK/test-logs}"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/jax-tests-${SLURM_JOB_ID:-$$}.pytest.out"
 
 set +e
-srun /usr/bin/singularity exec "$SIF" bash -c "
+srun /usr/bin/singularity exec \
+    -B "$AUTOTUNE_CACHE:$AUTOTUNE_CACHE" -B "$VENV_DIR:$VENV_DIR" \
+    --env VENV_DIR="$VENV_DIR" "$SIF" bash -c "
+    set -e
     export XLA_FLAGS=\"--xla_gpu_per_fusion_autotune_cache_dir=$AUTOTUNE_CACHE \${XLA_FLAGS:-}\"
     source $REPO_DIR/activate.sh
+    export LUMI_KERNELS_LIB=/opt/lumi-jax/lumi_kernels/lib
     cd $REPO_DIR
-    PY=$REPO_DIR/jax-venv/bin/python3
-    \$PY -m pytest tests -q -m 'not torch'
+    PY=$VENV_DIR/bin/python3
+    \$PY - <<'PYGPU'
+import jax
+from lumi_kernels.attention import flash_ffi
+devices = jax.devices()
+assert len(devices) == 8 and all(d.platform == 'gpu' for d in devices), devices
+assert flash_ffi.is_available(), 'CK attention library unavailable'
+print('BASE PREREQUISITES OK', devices)
+PYGPU
+    \$PY -m pytest tests -q
 " 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e

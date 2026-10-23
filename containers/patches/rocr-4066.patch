@@ -1,0 +1,34 @@
+From 559d48b1f013a2a8e9decd2557508de7ac6c6b10 Mon Sep 17 00:00:00 2001
+From: Qiang Han <qiang.han@amd.com>
+Date: Fri, 13 Mar 2026 00:07:25 +0000
+Subject: [PATCH] [rocr-runtime] Fix heap overflow in InterceptQueue staging
+ buffer
+
+The staging_buffer_ in InterceptQueue was hardcoded to 256 entries, but the
+ring buffer can hold up to queue_size entries (typically 4096+). When pending
+packets wrap around the ring buffer boundary and exceed 256, StoreRelaxed
+writes AQL packets past the vector allocation into adjacent heap memory.
+
+This caused non-deterministic SIGSEGV in multi-GPU training workloads (e.g.
+Llama-2-70B FP8 on 8x MI355X) where high kernel dispatch rates from RCCL
+AllReduce + FP8 quantization kernels could accumulate >256 pending packets.
+
+Fix: size the staging buffer to match the ring buffer (queue_size), which is
+what the original comment intended.
+---
+ .../runtime/hsa-runtime/core/runtime/intercept_queue.cpp        | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/intercept_queue.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/intercept_queue.cpp
+index 939a2093a7a6..038d8230e7e2 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/intercept_queue.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/intercept_queue.cpp
+@@ -128,7 +128,7 @@ InterceptQueue::InterceptQueue(std::unique_ptr<Queue> queue)
+   amd_queue_.hsa_queue.base_address = reinterpret_cast<void*>(&buffer_[0]);
+ 
+   // Pre-allocate staging buffer with queue size
+-  staging_buffer_.resize(256);
++  staging_buffer_.resize(wrapped->amd_queue_.hsa_queue.size);
+ 
+   // Fill the ring buffer with invalid packet headers.
+   // Leave packet content uninitialized to help trigger application errors.

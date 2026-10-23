@@ -1,116 +1,35 @@
-# Lean JAX image on the LAIF mpich layer. Everything the JAX ROCm plugin needs is inside:
-# no shim dir, no libdw from Cray PE, nothing on LD_LIBRARY_PATH.
-#   sbatch containers/build_jax.sbatch
-#
-# For a portable build swap Bootstrap for the pinned Docker Hub tag:
-#   Bootstrap: docker
-#   From: lumiaifactory/lumi-multitorch:mpich-u24r70f21m50t210-20260513_121430
-
-# BASE is the LAIF mpich layer, supplied via --build-arg from tools/image_name.sh.
+# JAX on the native ROCm 7.2 LAIF MPICH layer.
 Bootstrap: localimage
 From: {{ BASE }}
 
 %files
-    # Path is relative to the build's working directory (repo root).
-    csrc/rccl_window_stub.c /opt/lumi-shim/rccl_window_stub.c
+    tools/verify_native_rocm.sh /opt/lumi-jax-tools/verify_native_rocm.sh
+    tools/install_jax_stack.sh /opt/lumi-jax-tools/install_jax_stack.sh
+    tools/install_xla_flags_hook.sh /opt/lumi-jax-tools/install_xla_flags_hook.sh
 
 %post
     set -eux
-    export DEBIAN_FRONTEND=noninteractive
-
-    # --- shim 1: libdw, pulled in by the plugin's elfutils and absent from mpich ---
-    apt-get update
-    apt-get install -y --no-install-recommends libdw1t64
-    rm -rf /var/lib/apt/lists/*
-
-    # --- shim 2: librocm_smi64 soname; plugin wants .so.1, ROCm 7.0.2 ships only .so.7 ---
-    # The link goes in a *trusted default* dir: ldconfig indexes by ELF SONAME, so it never
-    # reaches the cache, but that dir is searched regardless.
-    ln -sf /opt/rocm/lib/librocm_smi64.so.7 /usr/lib/x86_64-linux-gnu/librocm_smi64.so.1
-    echo /opt/rocm/lib > /etc/ld.so.conf.d/zz-lumi-jax-rocm.conf
-    ldconfig
-    python3 -c "import ctypes; ctypes.CDLL('librocm_smi64.so.1'); print('librocm_smi64.so.1 loads')" \
-        || { echo "FATAL: librocm_smi64.so.1 not loadable"; exit 1; }
-
-    # --- shim 3: RCCL window API (STOPGAP) ---
-    # JAX 0.8+ links ncclCommWindowRegister/Deregister, absent from this base's RCCL; the
-    # stub satisfies the loader and is never called on our pmap paths. It is a correctness
-    # liability, and the RCCL 2.27+ layer above drops it.
-    gcc -shared -fPIC -o /opt/lumi-shim/librccl_window_stub.so /opt/lumi-shim/rccl_window_stub.c
-    test -s /opt/lumi-shim/librccl_window_stub.so
-
+    chmod -R a+rX /opt/lumi-jax-tools
+    bash /opt/lumi-jax-tools/verify_native_rocm.sh
     python3 -m venv /opt/venv
-    . /opt/venv/bin/activate
-    pip install --no-cache-dir --upgrade pip
-
-    # jax-rocm7-plugin 0.9.2+ links hipblaslt_ext::GemmInstance::setMaxWorkspaceBytes, which
-    # ROCm 7.0.2 lacks. Every later pip call carries this, or flax/orbax move the pin.
-    cat > /opt/venv/lumi-jax-constraints.txt <<'EOF'
-jax==0.9.1
-jaxlib==0.9.1
-jax-rocm7-plugin==0.9.1.post5
-jax-rocm7-pjrt==0.9.1.post5
-EOF
-    PIP="pip install --no-cache-dir -c /opt/venv/lumi-jax-constraints.txt"
-
-    $PIP 'jax==0.9.1' 'jax-rocm7-plugin==0.9.1.post5' 'jax-rocm7-pjrt==0.9.1.post5'
-
-    # ray[tune] deliberately NOT here: at this rung it forces a rebuild of every rung above
-    # -- 13 jobs for one pip package -- so it goes in at the product leaves.
-    #
-    # THIS LIST IS THE CONTRACT BETWEEN THE TWO PRODUCTS. jax-torch-base.def (the torch root)
-    # and jax-version.def (the retarget) install the same one; a package in only some of them
-    # makes `lean` and `torch` differ in what a user can import. jaxtyping is named here even
-    # though orbax-export pulls it in anyway -- a transitive dependency is not a guarantee.
-    $PIP flax optax orbax-checkpoint grain chex jaxtyping pytest
-
-    # Against the container's MPICH, not a bundled MPI.
-    if command -v mpicc >/dev/null 2>&1; then
-        MPICC="$(command -v mpicc)" $PIP --no-binary=mpi4py mpi4py
-        $PIP mpi4jax
-    else
-        echo "WARNING: mpicc not found; skipping mpi4py/mpi4jax" >&2
-    fi
-
-    python3 - <<'EOF'
-import importlib.metadata as md
-for pkg, want in [("jax", "0.9.1"), ("jaxlib", "0.9.1"),
-                  ("jax-rocm7-plugin", "0.9.1.post5"), ("jax-rocm7-pjrt", "0.9.1.post5")]:
-    got = md.version(pkg)
-    assert got == want, f"FATAL: {pkg} is {got}, expected {want}"
-    print(f"pin ok: {pkg}=={got}")
-EOF
+    /opt/venv/bin/python -m pip install --no-cache-dir --upgrade pip
+    bash /opt/lumi-jax-tools/install_jax_stack.sh 0.9.1
 
 %environment
     export PATH=/opt/venv/bin:$PATH
 
-    # Stopgap: remove these without upgrading RCCL and the plugin fails to load.
-    export LD_PRELOAD=/opt/lumi-shim/librccl_window_stub.so${LD_PRELOAD:+:$LD_PRELOAD}
-    export NCCL_WIN_ENABLE=0
-
-    # Deliberately NOT set: NCCL_NET_GDR_LEVEL (multi-node hangs) or the FI_* mitigations.
-
 %test
-    . /opt/venv/bin/activate
-    python3 -c "import jax; d = jax.devices(); print('devices:', len(d), d[:1]); assert len(d) >= 1"
-    python3 -c "import jax, jax.numpy as jnp; x = jnp.ones((256, 256)); print('matmul ok:', float((x @ x).sum()))"
+    python3 -c "import jax; d=jax.devices(); print(d); assert len(d) >= 1"
+    python3 -c "import jax.numpy as jnp; x=jnp.ones((256,256)); assert float((x@x).sum()) == 256**3"
 
 %labels
-    Description  JAX on the LAIF mpich layer, shim-free (except the RCCL stopgap)
-    JAX          0.9.1
-    JAXPlugin    0.9.1.post5
-    BaseImage    lumi-multitorch-mpich-u24r70f21m50t210-20260513_121430
-    ROCm         7.0.2
+    Description JAX on the native ROCm 7.2.4 MPICH layer
+    JAX 0.9.1
+    JAXPlugin 0.9.1.post5
+    BaseImage {{ BASE }}
+    ROCm 7.2.4
+    RCCL 2.27.7
 
 %help
-    JAX 0.9.1 for MI250X (gfx90a) on ROCm 7.0.2, built on the LUMI AI Factory mpich image.
-
-    Needs no external library directory: libdw and the librocm_smi64 soname are fixed inside.
-    The RCCL window-API stub is a stopgap, preloaded via %environment; the stage-net image
-    (RCCL 2.27.7) drops it and is the one to use where possible.
-
-    Run with the LAIF singularity bindings module loaded:
-      module use /appl/local/laifs/modules && module load lumi-aif-singularity-bindings
-
-    Do not set NCCL_NET_GDR_LEVEL. For multi-node hangs, try
-    FI_CXI_DISABLE_HOST_REGISTER=1 and FI_MR_CACHE_MONITOR=userfaultfd at runtime.
+    JAX 0.9.1 on gfx90a with native RCCL and hipBLASLt.
+    Load the LUMI singularity bindings module before running the image.

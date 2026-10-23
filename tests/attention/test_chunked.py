@@ -1,5 +1,5 @@
 """Correctness of memory-efficient attention paths vs the explicit jnp reference:
-chunked (pure JAX), pallas (Triton; `torch` image), and the FFI
+chunked (pure JAX) and the CK FFI
 (covered exhaustively in test_flash_ffi.py; spot-checked vs the naive ref here)."""
 import numpy as np
 import pytest
@@ -61,43 +61,40 @@ def test_chunked_remat_matches():
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-6, rtol=1e-6)
 
 
-@pytest.mark.torch
-@pytest.mark.parametrize("causal", [False, True])
-def test_pallas_flash(causal):
-    """Pallas/Triton flash at D=128 (needs triton from the `torch` image)."""
-    pa = pytest.importorskip("jax.experimental.pallas.ops.gpu.attention")
-    q, k, v = _inputs(S=512, H=8, D=128, dtype=jnp.float16)
-    scale = 1.0 / (128 ** 0.5)
-    bs = pa.BlockSizes(block_q=64, block_k=64, block_q_dkv=32, block_kv_dkv=32,
-                       block_q_dq=32, block_kv_dq=32)
-    f = lambda q, k, v: pa.mha(q, k, v, segment_ids=None, sm_scale=scale,
-                               causal=causal, block_sizes=bs)
-    ref = reference.naive_reference(q, k, v, causal=causal)
-    got = jax.jit(f)(q, k, v)
-    np.testing.assert_allclose(np.asarray(got, np.float32), np.asarray(ref, np.float32),
-                               atol=3e-2, rtol=3e-2)
-    g = jax.grad(lambda *a: jnp.sum(f(*a).astype(jnp.float32)), (0, 1, 2))(q, k, v)
-    assert g[0].shape == q.shape
-
-
-@pytest.mark.torch
 @pytest.mark.so("liblumi_fa_ffi.so")
 @pytest.mark.parametrize("causal", [False, True])
-def test_ffi_vs_naive_ref(causal):
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
+@pytest.mark.parametrize("kv_heads", [8, 2, 1])
+def test_ffi_vs_naive_ref(causal, dtype, kv_heads):
     """Spot-check the FFI against the naive jnp reference (independent of flash_attn)."""
     from lumi_kernels.attention import flash_ffi as ffi
 
-    q, k, v = _inputs(S=512, H=8, D=128, dtype=jnp.bfloat16)
+    q, k, v = _inputs(S=512, H=8, D=128, dtype=dtype)
+    k, v = k[:, :, :kv_heads], v[:, :, :kv_heads]
+    cotangent = _inputs(S=512, H=8, D=128, dtype=dtype, seed=1)[0]
     scale = 1.0 / (128 ** 0.5)
     fn = jax.jit(lambda q, k, v: ffi.flash_attention_ffi(q, k, v, causal=causal, scale=scale))
-    ref = reference.naive_reference(q, k, v, causal=causal)
+    def oracle(q, k, v):
+        repeats = q.shape[2] // k.shape[2]
+        return reference.naive_reference(q, jnp.repeat(k, repeats, axis=2),
+                                         jnp.repeat(v, repeats, axis=2), causal=causal)
+    ref = oracle(q, k, v)
+    atol, rtol = (2e-3, 3e-2) if dtype == jnp.bfloat16 else (3e-4, 5e-3)
     np.testing.assert_allclose(np.asarray(fn(q, k, v), np.float32),
-                               np.asarray(ref, np.float32), atol=3e-2, rtol=3e-2)
+                               np.asarray(ref, np.float32), atol=atol, rtol=rtol)
     g = jax.jit(jax.grad(lambda q, k, v: jnp.sum(
-        ffi.flash_attention_ffi(q, k, v, causal=causal, scale=scale).astype(jnp.float32)),
+        ffi.flash_attention_ffi(q, k, v, causal=causal, scale=scale).astype(jnp.float32)
+        * cotangent.astype(jnp.float32)),
         (0, 1, 2)))(q, k, v)
+    # Keep grouped-head gradient reductions in FP32 before storage rounding.
     gref = jax.grad(lambda q, k, v: jnp.sum(
-        reference.naive_reference(q, k, v, causal=causal).astype(jnp.float32)), (0, 1, 2))(q, k, v)
+        oracle(q, k, v).astype(jnp.float32) * cotangent.astype(jnp.float32)),
+        (0, 1, 2))(*(x.astype(jnp.float32) for x in (q, k, v)))
     for nm, a, b in zip("qkv", g, gref):
-        np.testing.assert_allclose(np.asarray(a, np.float32), np.asarray(b, np.float32),
-                                   atol=6e-2, rtol=6e-2, err_msg=f"d{nm}")
+        actual, expected = np.asarray(a, np.float32), np.asarray(b, np.float32)
+        # Grouped-head cancellation makes elementwise relative error unstable.
+        relative_l2 = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+        assert relative_l2 <= rtol, f"d{nm}: relative L2 error {relative_l2} > {rtol}"
+        np.testing.assert_allclose(actual, expected, rtol=0,
+                                   atol=atol + rtol * np.max(np.abs(expected)),
+                                   err_msg=f"d{nm} maximum error")
